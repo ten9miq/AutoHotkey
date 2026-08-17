@@ -54,9 +54,46 @@ IndicatorColorUnknown := "000000"
 ProvisionalDisplayPolicy := "Show" ; Show / HideUntilInput
 UseFocusChangedEvent := false ; true: UIAフォーカスイベントで即時反応 / false: 可変ポーリングのみ（低負荷）
 ; --- 診断・計測用の設定（本体機能とは独立） ---
-DiagnosticEnabled := false
+DiagnosticEnabled := HasCommandLineSwitch("--ime-position-diagnostics")
 DiagnosticDeepUiaEnabled := false ; true の場合だけ変換中UIA探索も診断する
 DiagnosticLogPath := A_ScriptDir "\logs\IME入力モード表示.log"
+ViewportDiagnosticQuietMs := 180
+ViewportDiagnosticRetryIntervalMs := 220
+ViewportDiagnosticRetryMax := 4
+ViewportDiagnosticRetryDeadlineMs := 1200
+ViewportState := {
+    generation: 0,
+    active: false,
+    dirty: false,
+    reacquirePending: false,
+    startTick: 0,
+    lastInputTick: 0,
+    settledTick: 0,
+    reacquireTick: 0,
+    retryCount: 0,
+    deadlineTick: 0,
+    nextRetryTick: 0,
+    inputKind: "",
+    previousCaret: "",
+    caretEvidenceTick: 0,
+    caretLocationEventTick: 0,
+    caretLocationEventHwnd: 0,
+    caretLocationEventCount: 0,
+    systemScrollStartTick: 0,
+    systemScrollEndTick: 0
+}
+ViewportDiagnosticState := ViewportState ; 診断関数との共有参照
+AnchorState := {
+    caret: "",
+    elementRect: ""
+}
+DisplayFallbackState := {
+    click: "",
+    pointer: "",
+    elementRect: ""
+}
+ImeStateDirty := true
+CaretStateDirty := true
 CandidateWindowLogPath := A_ScriptDir "\logs\IME候補ウィンドウ詳細.tsv"
 PerformanceDiagnosticEnabled := false
 PerformanceSlowThresholdMs := 20
@@ -81,7 +118,8 @@ IndicatorState := {
     anchorVersion: -1,
     exactX: 0,
     exactY: 0,
-    exactAnchorVersion: -1
+    exactAnchorVersion: -1,
+    exactViewportGeneration: -1
 }
 
 InstallKeybdHook()
@@ -94,8 +132,13 @@ UIA.SetMaximumDPIAwareness()
 CreateImeIndicator()
 InitializeImeKeyTracking()
 InitializeImeMonitor()
+InitializeViewportDiagnostics()
 
 ~LButton Up::RememberCaretClickPosition()
+~*WheelUp::MarkViewportInput("WheelUp")
+~*WheelDown::MarkViewportInput("WheelDown")
+~*WheelLeft::MarkViewportInput("WheelLeft")
+~*WheelRight::MarkViewportInput("WheelRight")
 ~*Space::TrackImeConversionKey()
 ~*Enter::EndTrackedImeConversion()
 ~*Esc::EndTrackedImeConversion()
@@ -475,9 +518,237 @@ ToggleImeDiagnostics() {
             DirCreate logDirectory
         AppendLogWithRetry(DiagnosticLogPath
             , "`n--- diagnostics started " FormatTime(, "yyyy-MM-dd HH:mm:ss") " ---`n")
+        InstallViewportWinEventDiagnostics()
+    } else {
+        RemoveViewportWinEventDiagnostics()
     }
     TrayTip "IME入力モード表示"
         , DiagnosticEnabled ? "診断ログ: ON" : "診断ログ: OFF"
+}
+
+HasCommandLineSwitch(expected) {
+    for argument in A_Args
+        if argument = expected
+            return true
+    return false
+}
+
+InitializeViewportDiagnostics() {
+    global DiagnosticEnabled, DiagnosticLogPath
+    if !DiagnosticEnabled
+        return
+    SplitPath DiagnosticLogPath, , &logDirectory
+    if !DirExist(logDirectory)
+        DirCreate logDirectory
+    AppendLogWithRetry(DiagnosticLogPath
+        , "`n--- viewport diagnostics started " FormatTime(, "yyyy-MM-dd HH:mm:ss") " ---`n")
+    InstallViewportWinEventDiagnostics()
+    OnExit CleanupViewportDiagnostics
+}
+
+CleanupViewportDiagnostics(*) {
+    RemoveViewportWinEventDiagnostics()
+}
+
+InstallViewportWinEventDiagnostics() {
+    global ViewportScrollWinEventHook, ViewportCaretWinEventHook, ViewportWinEventCallback
+    if IsSet(ViewportWinEventCallback) && ViewportWinEventCallback
+        return
+    ViewportWinEventCallback := CallbackCreate(HandleViewportWinEvent, "F", 7)
+    ViewportScrollWinEventHook := DllCall("user32\SetWinEventHook"
+        , "UInt", 0x0012, "UInt", 0x0013, "Ptr", 0
+        , "Ptr", ViewportWinEventCallback, "UInt", 0, "UInt", 0, "UInt", 0, "Ptr")
+    ViewportCaretWinEventHook := DllCall("user32\SetWinEventHook"
+        , "UInt", 0x800B, "UInt", 0x800B, "Ptr", 0
+        , "Ptr", ViewportWinEventCallback, "UInt", 0, "UInt", 0, "UInt", 0, "Ptr")
+}
+
+RemoveViewportWinEventDiagnostics() {
+    global ViewportScrollWinEventHook, ViewportCaretWinEventHook, ViewportWinEventCallback
+    if IsSet(ViewportScrollWinEventHook) && ViewportScrollWinEventHook
+        DllCall("user32\UnhookWinEvent", "Ptr", ViewportScrollWinEventHook)
+    if IsSet(ViewportCaretWinEventHook) && ViewportCaretWinEventHook
+        DllCall("user32\UnhookWinEvent", "Ptr", ViewportCaretWinEventHook)
+    if IsSet(ViewportWinEventCallback) && ViewportWinEventCallback
+        CallbackFree(ViewportWinEventCallback)
+    ViewportScrollWinEventHook := 0
+    ViewportCaretWinEventHook := 0
+    ViewportWinEventCallback := 0
+}
+
+HandleViewportWinEvent(hook, event, hwnd, idObject, idChild, eventThread, eventTime) {
+    global DiagnosticEnabled, ViewportDiagnosticState
+    if !DiagnosticEnabled
+        return
+    if event = 0x0012 {
+        if ViewportDiagnosticState.active
+            ViewportDiagnosticState.systemScrollStartTick := A_TickCount
+        return
+    }
+    if event = 0x0013 {
+        if ViewportDiagnosticState.active
+            ViewportDiagnosticState.systemScrollEndTick := A_TickCount
+        return
+    }
+    if event = 0x800B && idObject = -8 {
+        ViewportDiagnosticState.caretLocationEventTick := A_TickCount
+        ViewportDiagnosticState.caretLocationEventHwnd := hwnd
+        ViewportDiagnosticState.caretLocationEventCount :=
+            Min(ViewportDiagnosticState.caretLocationEventCount + 1, 1000000)
+    }
+}
+
+MarkViewportInput(kind) {
+    global ViewportDiagnosticQuietMs, ViewportState, CaretStateDirty, AnchorState
+    tick := A_TickCount
+    CaretStateDirty := true
+    if !ViewportState.active {
+        ViewportState.active := true
+        ViewportState.dirty := true
+        ViewportState.reacquirePending := false
+        ViewportState.generation += 1
+        ViewportState.startTick := tick
+        ViewportState.settledTick := 0
+        ViewportState.reacquireTick := 0
+        ViewportState.deadlineTick := 0
+        ViewportState.nextRetryTick := 0
+        ViewportState.retryCount := 0
+        ViewportState.previousCaret := ""
+        if IsObject(AnchorState.caret)
+            ViewportState.previousCaret := AnchorState.caret.Clone()
+        ViewportState.caretLocationEventCount := 0
+        ViewportState.caretLocationEventTick := 0
+        ViewportState.systemScrollStartTick := 0
+        ViewportState.systemScrollEndTick := 0
+    }
+    ViewportState.lastInputTick := tick
+    ViewportState.inputKind := kind
+    SetTimer SettleViewportDiagnostic, -ViewportDiagnosticQuietMs
+}
+
+SettleViewportDiagnostic() {
+    global ViewportDiagnosticQuietMs, ViewportDiagnosticRetryDeadlineMs, ViewportState
+        , AnchorProbePending, AnchorProbeNotBeforeTick, TooltipAnchorVersion
+    if !ViewportState.active
+        return
+    remaining := ViewportDiagnosticQuietMs
+        - (A_TickCount - ViewportState.lastInputTick)
+    if remaining > 0 {
+        SetTimer SettleViewportDiagnostic, -remaining
+        return
+    }
+    ViewportState.active := false
+    ViewportState.reacquirePending := true
+    ViewportState.settledTick := A_TickCount
+    ViewportState.deadlineTick := A_TickCount + ViewportDiagnosticRetryDeadlineMs
+    ViewportState.nextRetryTick := A_TickCount
+    ViewportState.retryCount := 0
+    AnchorProbePending := true
+    AnchorProbeNotBeforeTick := A_TickCount
+    TooltipAnchorVersion += 1
+    RequestImeMonitor()
+}
+
+GetElementRectDiagnostic(element, context, runtimeId) {
+    try {
+        rectangle := element.BoundingRectangle
+        if rectangle.r > rectangle.l && rectangle.b > rectangle.t
+            return CreateAnchorResult(true, rectangle.l, rectangle.t, "UIAElementRect"
+                , "Fallback", true
+                , "size=" Round(rectangle.r - rectangle.l) "x" Round(rectangle.b - rectangle.t)
+                , 0, context.hwnd, runtimeId)
+    }
+    return CreateAnchorResult(, , , "UIAElementRect", "Invalid"
+        , true, "BoundingRectangleUnavailable", 0, context.hwnd, runtimeId)
+}
+
+LogViewportDiagnosticCandidates(context, candidates) {
+    global DiagnosticLogPath, ViewportDiagnosticState, LastDiagnosticCaretAnchor
+    previous := ViewportDiagnosticState.previousCaret
+    previousText := "none"
+    if IsObject(previous)
+        previousText := (previous.source "/" GetDiagnosticSourceClass(previous.source) "/"
+            . previous.confidence "/" previous.x "," previous.y "/rid=" previous.runtimeId)
+    common := (FormatTime(, "yyyy-MM-dd HH:mm:ss.fff") "`tVIEWPORT"
+        . "`tprocess=" SanitizeLogField(context.processName)
+        . "`thwnd=" context.hwnd
+        . "`tgen=" ViewportDiagnosticState.generation
+        . "`tstart=" ViewportDiagnosticState.startTick
+        . "`tlastInput=" ViewportDiagnosticState.lastInputTick
+        . "`tsettled=" ViewportDiagnosticState.settledTick
+        . "`treacquire=" ViewportDiagnosticState.reacquireTick
+        . "`tretry=" ViewportDiagnosticState.retryCount
+        . "`tinput=" ViewportDiagnosticState.inputKind
+        . "`tprevCaret=" SanitizeLogField(previousText)
+        . "`tcaretEvidenceTick=" ViewportDiagnosticState.caretEvidenceTick
+        . "`tcaretEventTick=" ViewportDiagnosticState.caretLocationEventTick
+        . "`tcaretEventCount=" ViewportDiagnosticState.caretLocationEventCount
+        . "`tscrollEventStart=" ViewportDiagnosticState.systemScrollStartTick
+        . "`tscrollEventEnd=" ViewportDiagnosticState.systemScrollEndTick)
+    output := ""
+    selected := false
+    selectedCandidate := ""
+    for candidate in candidates {
+        sourceClass := GetDiagnosticSourceClass(candidate.source)
+        if candidate.HasOwnProp("diagnosticDecision") {
+            decision := candidate.diagnosticDecision
+            decisionReason := candidate.diagnosticReason
+            if decision = "Adopt" && !IsObject(selectedCandidate)
+                selectedCandidate := candidate
+        } else if candidate.found && sourceClass = "Caret" && IsObject(previous)
+            && candidate.x = previous.x && candidate.y = previous.y {
+            decision := "Reject"
+            decisionReason := "AmbiguousSameAcrossViewport"
+        } else if !selected && candidate.found && sourceClass = "Caret" {
+            decision := "WouldAdopt"
+            decisionReason := "NoCaretBaseline"
+            if IsObject(previous)
+                decisionReason := "CaretChangedWithinSourceClass"
+            selected := true
+            selectedCandidate := candidate
+        } else if !candidate.found {
+            decision := "Reject"
+            decisionReason := candidate.reason != "" ? candidate.reason : "Unavailable"
+        } else if sourceClass != "Caret" {
+            decision := "FallbackOnly"
+            decisionReason := "NotCaretEvidence"
+        } else {
+            decision := "Reject"
+            decisionReason := "EarlierCaretCandidate"
+        }
+        output .= (common
+            . "`tsource=" candidate.source
+            . "`tsourceClass=" sourceClass
+            . "`tcoord=" candidate.x "," candidate.y
+            . "`tconfidence=" candidate.confidence
+            . "`truntimeId=" SanitizeLogField(candidate.runtimeId)
+            . "`tfreshness=" SanitizeLogField(candidate.freshness)
+            . "`tdecision=" decision
+            . "`tdecisionReason=" SanitizeLogField(decisionReason) "`n")
+    }
+    AppendLogWithRetry(DiagnosticLogPath, output)
+    if IsObject(selectedCandidate)
+        LastDiagnosticCaretAnchor := selectedCandidate.Clone()
+}
+
+GetDiagnosticSourceClass(source) {
+    return GetAnchorSourceClass(source)
+}
+
+GetAnchorSourceClass(source) {
+    if source = "NativeCaret" || source = "GUIThreadCaret" || source = "MSAACaret"
+        || source = "CachedCaretAnchor" || source = "CachedAnchor"
+        || InStr(source, "CaretRange") || InStr(source, "Selection")
+        || InStr(source, "Composition") || InStr(source, "ConversionTarget")
+        return "Caret"
+    if source = "UIAElementRect" || source = "UIAEmptyInputField"
+        return "ElementRect"
+    if source = "RecentClickFallback" || source = "ClickInsideElementFallback"
+        || source = "UIAFallback"
+        return "ClickEvidence"
+    if source = "CurrentPointerFallback" || source = "PointerFallback"
+        return "PointerFallback"
+    return "Unknown"
 }
 
 TogglePerformanceDiagnostics() {
@@ -694,7 +965,7 @@ FormatCandidateUIAElement(timestamp, hostHwnd, depth, element) {
 }
 
 LogAnchorDiagnostic(anchor, isConverting, displayState) {
-    global DiagnosticEnabled, DiagnosticLogPath
+    global DiagnosticEnabled, DiagnosticLogPath, ViewportState
     static lastSignature := ""
     if !DiagnosticEnabled
         return
@@ -714,7 +985,10 @@ LogAnchorDiagnostic(anchor, isConverting, displayState) {
         . anchor.confidence "`t" anchor.x "," anchor.y "`t"
         . "fallback=" anchor.isFallback "`tconverting=" isConverting "`t"
         . "depth=" anchor.depth "`thwnd=" anchor.hwnd "`t"
-        . "runtimeId=" anchor.runtimeId "`t" anchor.reason "`n")
+        . "runtimeId=" anchor.runtimeId "`tsourceClass=" anchor.sourceClass
+        . "`tviewportGen=" anchor.viewportGeneration
+        . "`tfreshness=" anchor.freshness
+        . "`tretry=" ViewportState.retryCount "`t" anchor.reason "`n")
     AppendLogWithRetry(DiagnosticLogPath, line)
 }
 
@@ -780,27 +1054,41 @@ DetectUIACompositionSignal() {
 ; ============================================================================
 
 RememberCaretClickPosition() {
-    global lastClickX, lastClickY, lastClickScore, lastClickWindow, lastClickTick
-        , TooltipAnchorVersion, TrackedImeConversionTick, DetectedImeConversionTick
+    global LastClickEventTick, TrackedImeConversionTick, DetectedImeConversionTick
         , LastAnchorActivityTick, AnchorProbeNotBeforeTick, AnchorProbePending
-    MouseGetPos &lastClickX, &lastClickY, &lastClickWindow
-    lastClickTick := A_TickCount
-    LastAnchorActivityTick := lastClickTick
-    AnchorProbeNotBeforeTick := lastClickTick + 150
+        , ImeStateDirty, CaretStateDirty
+    LastClickEventTick := A_TickCount
+    LastAnchorActivityTick := LastClickEventTick
+    AnchorProbeNotBeforeTick := LastClickEventTick + 150
     AnchorProbePending := true
+    ImeStateDirty := true
+    CaretStateDirty := true
     TrackedImeConversionTick := 0
     DetectedImeConversionTick := 0
+    RearmViewportCaretReacquire(LastClickEventTick)
+    SetTimer CaptureCaretClickEvidence, -1
+    RequestImeMonitor()
+}
+
+CaptureCaretClickEvidence() {
+    global LastClickEventTick, lastClickX, lastClickY, lastClickScore
+        , lastClickWindow, lastClickTick, TooltipAnchorVersion
+    MouseGetPos &lastClickX, &lastClickY, &lastClickWindow
+    lastClickTick := LastClickEventTick
     TooltipAnchorVersion += 1
     lastClickScore := 0
     SetTimer RefreshClickedElement, -150
-    RequestImeMonitor() ; イベント未使用時でもクリック直後に即時反映
 }
 
 TrackImeConversionKey() {
     global LastConversionKeyTick, LastAnchorActivityTick, AnchorProbePending
+        , ImeStateDirty, CaretStateDirty
     LastConversionKeyTick := A_TickCount
     LastAnchorActivityTick := LastConversionKeyTick
     AnchorProbePending := true
+    ImeStateDirty := true
+    CaretStateDirty := true
+    MarkPostViewportCaretEvidence(LastConversionKeyTick)
     RequestImeMonitor()
 }
 
@@ -822,9 +1110,16 @@ CleanupImeKeyTracking(*) {
 
 HandleImeTextKeyDown(inputHook, virtualKey, scanCode) {
     global LastTextInputTick, LastAnchorActivityTick, AnchorProbePending
+        , ImeStateDirty, CaretStateDirty
+    isViewportKey := virtualKey = 0x21 || virtualKey = 0x22
+    if isViewportKey
+        MarkViewportInput(virtualKey = 0x21 ? "PageUp" : "PageDown")
     if IsCaretNavigationVirtualKey(virtualKey) {
         LastAnchorActivityTick := A_TickCount
         AnchorProbePending := true
+        CaretStateDirty := true
+        if !isViewportKey
+            MarkPostViewportCaretEvidence(LastAnchorActivityTick)
         RequestImeMonitor()
         return
     }
@@ -838,6 +1133,25 @@ HandleImeTextKeyDown(inputHook, virtualKey, scanCode) {
     LastTextInputTick := A_TickCount
     LastAnchorActivityTick := LastTextInputTick
     AnchorProbePending := true
+    ImeStateDirty := true
+    CaretStateDirty := true
+    MarkPostViewportCaretEvidence(LastTextInputTick)
+}
+
+MarkPostViewportCaretEvidence(tick) {
+    global ViewportState
+    ViewportState.caretEvidenceTick := tick
+    RearmViewportCaretReacquire(tick)
+}
+
+RearmViewportCaretReacquire(tick) {
+    global ViewportDiagnosticRetryDeadlineMs, ViewportState
+    if !ViewportState.dirty || ViewportState.active
+        return
+    ViewportState.reacquirePending := true
+    ViewportState.retryCount := 0
+    ViewportState.deadlineTick := tick + ViewportDiagnosticRetryDeadlineMs
+    ViewportState.nextRetryTick := tick + 120
 }
 
 GetImeTextInputKeyList() {
@@ -876,9 +1190,12 @@ IsJapaneseImeMode(mode) {
 
 EndTrackedImeConversion() {
     global TrackedImeConversionTick := 0, DetectedImeConversionTick := 0
-        , LastAnchorActivityTick, AnchorProbePending
+        , LastAnchorActivityTick, AnchorProbePending, ImeStateDirty, CaretStateDirty
     LastAnchorActivityTick := A_TickCount
     AnchorProbePending := true
+    ImeStateDirty := true
+    CaretStateDirty := true
+    MarkPostViewportCaretEvidence(LastAnchorActivityTick)
     RequestImeMonitor()
 }
 
@@ -960,6 +1277,7 @@ GetImeMonitorInterval() {
 
 ShowImeMode() {
     global CurrentAnchorResult, MonitorCycleId, PerformanceDiagnosticEnabled
+        , ImeStateDirty, CaretStateDirty, AnchorProbePending, ViewportState
     static running := false
     if running
         return
@@ -970,6 +1288,8 @@ ShowImeMode() {
         context := DetectInputContext()
         PrepareAnchorContext(context)
         imeSnapshot := CaptureImeSnapshot(context)
+        if imeSnapshot.valid
+            ImeStateDirty := false
         ApplyPendingImeInput(imeSnapshot)
         DiagnoseConversionSignals(context, imeSnapshot)
         if !imeSnapshot.valid {
@@ -983,6 +1303,7 @@ ShowImeMode() {
         CurrentAnchorResult := ResolveAnchor(context)
         if CurrentAnchorResult.found
             RememberGoodAnchor(CurrentAnchorResult, context)
+        CaretStateDirty := ViewportState.dirty || AnchorProbePending
         if anchorStarted
             QueueSlowPerformance(context, "ResolveAnchor"
                 , PerformanceElapsedMs(anchorStarted), CurrentAnchorResult.source, false)
@@ -1007,7 +1328,7 @@ ShowImeMode() {
 }
 
 UpdateIndicatorState(context, anchor, modeDisplay, isConverting) {
-    global AnchorConfidence, IndicatorState, TooltipAnchorVersion
+    global AnchorConfidence, IndicatorState, TooltipAnchorVersion, ViewportState
     anchorChanged := IndicatorState.mode = "Hidden"
         || IndicatorState.anchorVersion != TooltipAnchorVersion
 
@@ -1015,6 +1336,7 @@ UpdateIndicatorState(context, anchor, modeDisplay, isConverting) {
         IndicatorState.exactX := anchor.x
         IndicatorState.exactY := anchor.y
         IndicatorState.exactAnchorVersion := TooltipAnchorVersion
+        IndicatorState.exactViewportGeneration := ViewportState.generation
     }
 
     nextMode := anchor.confidence = AnchorConfidence.Fallback ? "Provisional" : "Realtime"
@@ -1044,18 +1366,9 @@ UpdateIndicatorState(context, anchor, modeDisplay, isConverting) {
 }
 
 CalculateIndicatorPosition(context, anchor) {
-    global IndicatorOffsetX, IndicatorOffsetY, IndicatorState, TooltipAnchorVersion
-    if anchor.isFallback && !IsPointerFallbackSource(anchor.source)
-        && IndicatorState.exactAnchorVersion = TooltipAnchorVersion {
-        baseX := IndicatorState.exactX
-        baseY := IndicatorState.exactY
-    } else if anchor.isFallback {
-        baseX := anchor.x
-        baseY := anchor.y
-    } else {
-        baseX := anchor.x
-        baseY := anchor.y
-    }
+    global IndicatorOffsetX, IndicatorOffsetY
+    baseX := anchor.x
+    baseY := anchor.y
     return ClampIndicatorPosition(baseX + IndicatorOffsetX, baseY + IndicatorOffsetY
         , baseX, baseY)
 }
@@ -1324,7 +1637,13 @@ ShouldShowImeIndicator(anchor) {
 
 CreateAnchorResult(found := false, x := 0, y := 0, source := "None"
     , confidence := "Invalid", isFallback := true, reason := "", depth := 0
-    , hwnd := 0, runtimeId := "") {
+    , hwnd := 0, runtimeId := "", sourceClass := ""
+    , viewportGeneration := -1, freshness := "Unverified") {
+    global ViewportState
+    if sourceClass = ""
+        sourceClass := GetAnchorSourceClass(source)
+    if viewportGeneration < 0
+        viewportGeneration := ViewportState.generation
     return {
         found: found,
         x: x,
@@ -1335,7 +1654,11 @@ CreateAnchorResult(found := false, x := 0, y := 0, source := "None"
         reason: reason,
         depth: depth,
         hwnd: hwnd,
-        runtimeId: runtimeId
+        runtimeId: runtimeId,
+        sourceClass: sourceClass,
+        viewportGeneration: viewportGeneration,
+        freshness: freshness,
+        capturedTick: A_TickCount
     }
 }
 
@@ -1490,7 +1813,8 @@ TryGetGuiThreadCaretAnchor(context) {
 PrepareAnchorContext(context) {
     global AnchorContextHwnd, AnchorContextFocusHwnd, AnchorProbePending
         , AnchorProbeNotBeforeTick, LastAnchorProbeTick, TooltipAnchorVersion
-        , LastGoodAnchor, lastClickScore, lastClickWindow
+        , AnchorState, DisplayFallbackState, ViewportState
+        , lastClickScore, lastClickWindow
         , UiaCircuitOpenUntil, UiaCircuitSlowCount
         , MsaaCircuitOpenUntil, MsaaCircuitSlowCount
     if !AnchorContextHwnd {
@@ -1513,7 +1837,14 @@ PrepareAnchorContext(context) {
     MsaaCircuitOpenUntil := 0
     MsaaCircuitSlowCount := 0
     TooltipAnchorVersion += 1
-    LastGoodAnchor := ""
+    AnchorState.caret := ""
+    AnchorState.elementRect := ""
+    DisplayFallbackState.click := ""
+    DisplayFallbackState.pointer := ""
+    DisplayFallbackState.elementRect := ""
+    ViewportState.previousCaret := ""
+    ViewportState.reacquirePending := false
+    ViewportState.dirty := false
     if IsSet(lastClickWindow) && GetRootWindowHwnd(lastClickWindow) != context.hwnd
         lastClickScore := 0
 }
@@ -1608,10 +1939,18 @@ GetFocusedElementCached() {
 
 ResolveAnchor(context) {
     global AnchorConfidence, CaretPositionIsFallback
-        , AnchorProbePending, LastAnchorProbeTick
+        , AnchorProbePending, LastAnchorProbeTick, ViewportState
     if !context.hwnd
         return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
             , true, "ActiveWindowUnavailable")
+    if ViewportState.active
+        return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
+            , true, "ViewportSettling", , context.hwnd)
+    if ViewportState.reacquirePending
+        return ResolveViewportFreshAnchor(context)
+    if ViewportState.dirty
+        return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
+            , true, "ViewportFreshnessUnresolved", , context.hwnd)
 
     if CaretGetPos(&caretX, &caretY) {
         AnchorProbePending := false
@@ -1655,10 +1994,122 @@ ResolveAnchor(context) {
     if stableAnchor.found
         return stableAnchor
 
+    displayFallback := GetReusableDisplayFallback(context, uiaAnchor.reason)
+    if displayFallback.found
+        return displayFallback
+
     pointerAnchor := TryGetPointerFallbackAnchor(context, uiaAnchor.reason)
     if pointerAnchor.found
         return SelectStableAnchor(context, pointerAnchor)
     return uiaAnchor
+}
+
+ResolveViewportFreshAnchor(context) {
+    global AnchorConfidence, AnchorProbePending, LastAnchorProbeTick
+        , DiagnosticEnabled, ViewportDiagnosticRetryIntervalMs
+        , ViewportDiagnosticRetryMax, ViewportState
+    if A_TickCount < ViewportState.nextRetryTick
+        return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
+            , true, "ViewportReacquireDeferred", , context.hwnd)
+    if ViewportState.retryCount >= ViewportDiagnosticRetryMax
+        || A_TickCount > ViewportState.deadlineTick {
+        ViewportState.reacquirePending := false
+        AnchorProbePending := false
+        return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
+            , true, "ViewportFreshnessUnresolved", , context.hwnd)
+    }
+
+    ViewportState.retryCount += 1
+    ViewportState.reacquireTick := A_TickCount
+    LastAnchorProbeTick := A_TickCount
+    candidates := []
+    if CaretGetPos(&nativeX, &nativeY)
+        candidates.Push(CreateAnchorResult(true, nativeX, nativeY, "NativeCaret"
+            , AnchorConfidence.Exact, false, "", 0, context.hwnd))
+    else
+        candidates.Push(CreateAnchorResult(, , , "NativeCaret", AnchorConfidence.Invalid
+            , true, "CaretGetPosUnavailable", 0, context.hwnd))
+    candidates.Push(TryGetGuiThreadCaretAnchor(context))
+    candidates.Push(TryResolveMsaaAnchor(context))
+    candidates.Push(TryResolveUiaAnchor(context))
+
+    accepted := ""
+    for candidate in candidates {
+        evaluation := EvaluateViewportCaretCandidate(candidate, context)
+        candidate.diagnosticDecision := evaluation.accept ? "Adopt" : "Reject"
+        candidate.diagnosticReason := evaluation.reason
+        if !IsObject(accepted) && evaluation.accept {
+            candidate.freshness := "ViewportFresh:" evaluation.reason
+            accepted := candidate
+        } else if IsObject(accepted) && candidate.found {
+            candidate.diagnosticDecision := "Reject"
+            candidate.diagnosticReason := "EarlierFreshCaretCandidate"
+        }
+    }
+
+    if DiagnosticEnabled {
+        focusedElement := GetFocusedElementCached()
+        if focusedElement
+            candidates.Push(GetElementRectDiagnostic(focusedElement, context
+                , GetElementRuntimeId(focusedElement)))
+        LogViewportDiagnosticCandidates(context, candidates)
+    }
+
+    if IsObject(accepted) {
+        ViewportState.reacquirePending := false
+        ViewportState.dirty := false
+        AnchorProbePending := false
+        return accepted
+    }
+
+    if ViewportState.retryCount < ViewportDiagnosticRetryMax
+        && A_TickCount + ViewportDiagnosticRetryIntervalMs <= ViewportState.deadlineTick {
+        ViewportState.nextRetryTick := A_TickCount + ViewportDiagnosticRetryIntervalMs
+        AnchorProbePending := true
+        SetTimer RequestImeMonitor, -ViewportDiagnosticRetryIntervalMs
+        return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
+            , true, "ViewportFreshnessPending", , context.hwnd)
+    }
+    ViewportState.reacquirePending := false
+    AnchorProbePending := false
+    return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
+        , true, "ViewportFreshnessUnresolved", , context.hwnd)
+}
+
+EvaluateViewportCaretCandidate(candidate, context) {
+    global ViewportState
+    if !candidate.found
+        return {accept: false, reason: candidate.reason != "" ? candidate.reason : "Unavailable"}
+    if candidate.sourceClass != "Caret"
+        return {accept: false, reason: "NotCaretEvidence"}
+    pointReason := ValidateCaretScreenPoint(context, candidate.x, candidate.y)
+    if pointReason != ""
+        return {accept: false, reason: pointReason}
+    if candidate.source = "NativeCaret" || candidate.source = "GUIThreadCaret"
+        return {accept: true, reason: "NativeViewportQuery"}
+
+    previous := ViewportState.previousCaret
+    if IsObject(previous)
+        && (candidate.x != previous.x || candidate.y != previous.y)
+        return {accept: true, reason: "CaretChangedWithinSourceClass"}
+    if ViewportState.caretEvidenceTick > ViewportState.lastInputTick
+        return {accept: true, reason: "PostViewportInputEvidence"}
+    if ViewportState.caretLocationEventTick > ViewportState.lastInputTick
+        return {accept: true, reason: "PostViewportCaretLocationEvent"}
+    if !IsObject(previous)
+        return {accept: false, reason: "NoPriorCaretBaseline"}
+    return {accept: false, reason: "AmbiguousSameAcrossViewport"}
+}
+
+ValidateCaretScreenPoint(context, x, y) {
+    try WinGetPos &windowX, &windowY, &windowWidth, &windowHeight, "ahk_id " context.hwnd
+    catch
+        return "ActiveWindowRectUnavailable"
+    tolerance := 16
+    if x < windowX - tolerance || x > windowX + windowWidth + tolerance
+        || y < windowY - tolerance || y > windowY + windowHeight + tolerance
+        return "CaretOutsideActiveWindow"
+    return ""
 }
 
 ScheduleAnchorProbeAfterCircuit(msaaAnchor, uiaAnchor) {
@@ -1693,6 +2144,9 @@ ResolveDeferredAnchor(context, reason) {
     stableAnchor := GetReusableAnchor(context, reason)
     if stableAnchor.found
         return stableAnchor
+    displayFallback := GetReusableDisplayFallback(context, reason)
+    if displayFallback.found
+        return displayFallback
     pointerAnchor := TryGetPointerFallbackAnchor(context, reason)
     if pointerAnchor.found
         return pointerAnchor
@@ -1700,6 +2154,8 @@ ResolveDeferredAnchor(context, reason) {
 }
 
 SelectStableAnchor(context, candidate) {
+    if candidate.sourceClass != "Caret"
+        return candidate
     stableAnchor := GetReusableAnchor(context, "LowerConfidenceCandidate")
     if !stableAnchor.found || GetAnchorConfidenceRank(candidate.confidence)
         >= GetAnchorConfidenceRank(stableAnchor.confidence)
@@ -1719,10 +2175,9 @@ GetAnchorConfidenceRank(confidence) {
 }
 
 InvalidateStableAnchor(context) {
-    global LastGoodAnchor
-    if IsSet(LastGoodAnchor) && IsObject(LastGoodAnchor)
-        && LastGoodAnchor.hwnd = context.hwnd
-        LastGoodAnchor := ""
+    global AnchorState
+    if IsObject(AnchorState.caret) && AnchorState.caret.hwnd = context.hwnd
+        AnchorState.caret := ""
 }
 
 TryGetPointerFallbackAnchor(context, reason := "AnchorUnavailable") {
@@ -1803,40 +2258,76 @@ UpdateRecentClickEvidenceFromFocusedElement(context, editScore) {
 }
 
 RememberGoodAnchor(anchor, context) {
-    global LastGoodAnchor, TooltipAnchorVersion
-    if anchor.source = "CachedAnchor"
+    global AnchorState, DisplayFallbackState, TooltipAnchorVersion
+    if anchor.source = "CachedCaretAnchor" || anchor.source = "CachedAnchor"
         return
-    if IsSet(LastGoodAnchor) && IsObject(LastGoodAnchor)
-        && LastGoodAnchor.hwnd = context.hwnd
-        && LastGoodAnchor.focusHwnd = context.focusHwnd
-        && LastGoodAnchor.anchorVersion = TooltipAnchorVersion
+    sourceClass := anchor.sourceClass
+    if sourceClass = "Caret" && IsObject(AnchorState.caret)
+        && AnchorState.caret.hwnd = context.hwnd
+        && AnchorState.caret.focusHwnd = context.focusHwnd
+        && AnchorState.caret.anchorVersion = TooltipAnchorVersion
         && GetAnchorConfidenceRank(anchor.confidence)
-            < GetAnchorConfidenceRank(LastGoodAnchor.confidence)
+            < GetAnchorConfidenceRank(AnchorState.caret.confidence)
         return
-    LastGoodAnchor := {
+    snapshot := {
         x: anchor.x,
         y: anchor.y,
         source: anchor.source,
+        sourceClass: sourceClass,
         confidence: anchor.confidence,
         isFallback: anchor.isFallback,
         reason: anchor.reason,
         runtimeId: anchor.runtimeId,
+        viewportGeneration: anchor.viewportGeneration,
+        freshness: anchor.freshness,
         hwnd: context.hwnd,
         focusHwnd: context.focusHwnd,
         anchorVersion: TooltipAnchorVersion,
         capturedTick: A_TickCount
     }
+    switch sourceClass {
+        case "Caret":
+            if !anchor.isFallback
+                AnchorState.caret := snapshot
+        case "ElementRect":
+            AnchorState.elementRect := snapshot
+            DisplayFallbackState.elementRect := snapshot
+        case "ClickEvidence":
+            DisplayFallbackState.click := snapshot
+        case "PointerFallback":
+            DisplayFallbackState.pointer := snapshot
+    }
 }
 
 GetReusableAnchor(context, reason) {
-    global AnchorConfidence, LastGoodAnchor, TooltipAnchorVersion
-    if IsSet(LastGoodAnchor) && IsObject(LastGoodAnchor)
-        && LastGoodAnchor.hwnd = context.hwnd
-        && LastGoodAnchor.focusHwnd = context.focusHwnd
-        && LastGoodAnchor.anchorVersion = TooltipAnchorVersion {
-        return CreateAnchorResult(true, LastGoodAnchor.x, LastGoodAnchor.y
-            , "CachedAnchor", LastGoodAnchor.confidence, LastGoodAnchor.isFallback
-            , reason, , context.hwnd, LastGoodAnchor.runtimeId)
+    global AnchorConfidence, AnchorState, TooltipAnchorVersion, ViewportState
+    caret := AnchorState.caret
+    if IsObject(caret)
+        && caret.hwnd = context.hwnd
+        && caret.focusHwnd = context.focusHwnd
+        && caret.anchorVersion = TooltipAnchorVersion
+        && caret.viewportGeneration = ViewportState.generation {
+        return CreateAnchorResult(true, caret.x, caret.y
+            , "CachedCaretAnchor", caret.confidence, false
+            , reason, , context.hwnd, caret.runtimeId, "Caret"
+            , caret.viewportGeneration, caret.freshness)
+    }
+    return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
+        , true, reason, , context.hwnd)
+}
+
+GetReusableDisplayFallback(context, reason) {
+    global AnchorConfidence, DisplayFallbackState, TooltipAnchorVersion, ViewportState
+    fallback := DisplayFallbackState.elementRect
+    if IsObject(fallback)
+        && fallback.hwnd = context.hwnd
+        && fallback.focusHwnd = context.focusHwnd
+        && fallback.anchorVersion = TooltipAnchorVersion
+        && fallback.viewportGeneration = ViewportState.generation {
+        return CreateAnchorResult(true, fallback.x, fallback.y
+            , "CachedElementRectFallback", AnchorConfidence.Fallback, true
+            , reason, , context.hwnd, fallback.runtimeId, "ElementRect"
+            , fallback.viewportGeneration, fallback.freshness)
     }
     return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
         , true, reason, , context.hwnd)
@@ -1924,6 +2415,14 @@ GetUIACaretPos(element, &caretX, &caretY, context) {
     LastUIAConfidence := AnchorConfidence.Invalid
     LastUIADepth := 0
     LastUIAReason := ""
+    ; 空欄のEdit/ComboBoxでは、一時的に返るTextRange矩形が入力欄全体を指すことがある。
+    ; 論理キャレットは左端なので、TextPatternより先に要素矩形から安定位置を採る。
+    if GetUIAEmptyInputFieldPos(element, &caretX, &caretY) {
+        LastUIASource := "UIAEmptyInputField"
+        LastUIAConfidence := AnchorConfidence.Fallback
+        LastUIAReason := "EmptyInputField"
+        return true
+    }
     currentElement := element
     maxDepth := context.allowParentWalk ? 6 : 0
     Loop maxDepth + 1 {
@@ -2049,22 +2548,15 @@ GetUIAElementFallbackPos(element, &caretX, &caretY, &source) {
     global lastClickX, lastClickY, CaretPositionIsFallback
     source := "UIAFallback"
     ; 空欄のEdit/ComboBoxはキャレットが左端。クリック位置ではなく入力欄左端を基準にして安定させる
-    if IsUIAEmptyInputField(element) {
-        try {
-            rectangle := element.BoundingRectangle
-            if rectangle.r > rectangle.l && rectangle.b > rectangle.t {
-                caretX := rectangle.l + 8
-                caretY := rectangle.t + Floor((rectangle.b - rectangle.t) / 2)
-                source := "UIAEmptyInputField"
-                CaretPositionIsFallback := true
-                return true
-            }
-        }
+    if GetUIAEmptyInputFieldPos(element, &caretX, &caretY) {
+        source := "UIAEmptyInputField"
+        return true
     }
 
     if GetRecentClickEvidence() && IsSet(lastClickX) {
         caretX := lastClickX
         caretY := lastClickY
+        source := "RecentClickFallback"
         CaretPositionIsFallback := true
         return true
     }
@@ -2075,10 +2567,28 @@ GetUIAElementFallbackPos(element, &caretX, &caretY, &source) {
             && lastClickY >= rectangle.t && lastClickY <= rectangle.b {
             caretX := lastClickX
             caretY := lastClickY
+            source := "ClickInsideElementFallback"
             CaretPositionIsFallback := true
             return true
         }
 
+        if rectangle.r > rectangle.l && rectangle.b > rectangle.t {
+            caretX := rectangle.l + 8
+            caretY := rectangle.t + Floor((rectangle.b - rectangle.t) / 2)
+            source := "UIAElementRect"
+            CaretPositionIsFallback := true
+            return true
+        }
+    }
+    return false
+}
+
+GetUIAEmptyInputFieldPos(element, &caretX, &caretY) {
+    global CaretPositionIsFallback
+    if !IsUIAEmptyInputField(element)
+        return false
+    try {
+        rectangle := element.BoundingRectangle
         if rectangle.r > rectangle.l && rectangle.b > rectangle.t {
             caretX := rectangle.l + 8
             caretY := rectangle.t + Floor((rectangle.b - rectangle.t) / 2)
