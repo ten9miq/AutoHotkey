@@ -3,6 +3,10 @@
 #Include "lib\IMEv2.ahk"
 #Include "lib\UIAv2.ahk"
 
+; 高速ホイール入力は正常でも既定の70回/2秒を超えるため、暴走警告の保護を残して上限だけ調整する
+A_HotkeyInterval := 2000
+A_MaxHotkeysPerInterval := 200
+
 EditableScoreThreshold := 7
 TooltipIdleTimeout := 1000
 ConversionDetectionHoldMs := 10000
