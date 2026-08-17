@@ -15,19 +15,34 @@ MonitorTimerArmed := false
 MonitorNextDueTick := 0
 ImeCircuitOpenUntil := 0
 UiaCircuitOpenUntil := 0
+MsaaCircuitOpenUntil := 0
 TrackedImeConversionTick := 0
 DetectedImeConversionTick := 0
 LastTextInputTick := 0
 LastHandledTextInputTick := 0
 LastConversionKeyTick := 0
 LastHandledConversionKeyTick := 0
+LastAnchorActivityTick := 0
+LastAnchorProbeTick := 0
+AnchorProbeNotBeforeTick := 0
+AnchorProbePending := true
+AnchorContextHwnd := 0
+AnchorContextFocusHwnd := 0
 ImeQueryTimeoutMs := 35
 ImeStaleReuseMs := 300
 ImeCircuitSlowMs := 40
 ImeCircuitCooldownMs := 300
 UiaCircuitSlowMs := 50
-UiaCircuitCooldownMs := 300
-UiaAnchorReuseMs := 350
+UiaCircuitBaseCooldownMs := 1000
+UiaCircuitMaxCooldownMs := 30000
+UiaCircuitSlowCount := 0
+MsaaCircuitSlowMs := 50
+MsaaCircuitBaseCooldownMs := 1000
+MsaaCircuitMaxCooldownMs := 30000
+MsaaCircuitSlowCount := 0
+AnchorProbeQuietMs := 120
+ChromiumAnchorProbeMinIntervalMs := 250
+DefaultAnchorProbeMinIntervalMs := 120
 InputContextCacheMs := 1000
 IndicatorOffsetX := -70 ; 負数で左、正数で右
 IndicatorOffsetY := 36  ; 負数で上、正数で下
@@ -43,7 +58,7 @@ DiagnosticEnabled := false
 DiagnosticDeepUiaEnabled := false ; true の場合だけ変換中UIA探索も診断する
 DiagnosticLogPath := A_ScriptDir "\logs\IME入力モード表示.log"
 CandidateWindowLogPath := A_ScriptDir "\logs\IME候補ウィンドウ詳細.tsv"
-PerformanceDiagnosticEnabled := true
+PerformanceDiagnosticEnabled := false
 PerformanceSlowThresholdMs := 20
 PerformanceLogMaxBytes := 4 * 1024 * 1024
 PerformanceLogQueueMax := 128
@@ -767,8 +782,12 @@ DetectUIACompositionSignal() {
 RememberCaretClickPosition() {
     global lastClickX, lastClickY, lastClickScore, lastClickWindow, lastClickTick
         , TooltipAnchorVersion, TrackedImeConversionTick, DetectedImeConversionTick
+        , LastAnchorActivityTick, AnchorProbeNotBeforeTick, AnchorProbePending
     MouseGetPos &lastClickX, &lastClickY, &lastClickWindow
     lastClickTick := A_TickCount
+    LastAnchorActivityTick := lastClickTick
+    AnchorProbeNotBeforeTick := lastClickTick + 150
+    AnchorProbePending := true
     TrackedImeConversionTick := 0
     DetectedImeConversionTick := 0
     TooltipAnchorVersion += 1
@@ -778,8 +797,10 @@ RememberCaretClickPosition() {
 }
 
 TrackImeConversionKey() {
-    global LastConversionKeyTick
+    global LastConversionKeyTick, LastAnchorActivityTick, AnchorProbePending
     LastConversionKeyTick := A_TickCount
+    LastAnchorActivityTick := LastConversionKeyTick
+    AnchorProbePending := true
     RequestImeMonitor()
 }
 
@@ -800,8 +821,10 @@ CleanupImeKeyTracking(*) {
 }
 
 HandleImeTextKeyDown(inputHook, virtualKey, scanCode) {
-    global LastTextInputTick
+    global LastTextInputTick, LastAnchorActivityTick, AnchorProbePending
     if IsCaretNavigationVirtualKey(virtualKey) {
+        LastAnchorActivityTick := A_TickCount
+        AnchorProbePending := true
         RequestImeMonitor()
         return
     }
@@ -813,6 +836,8 @@ HandleImeTextKeyDown(inputHook, virtualKey, scanCode) {
     if GetKeyState("Ctrl", "P") || GetKeyState("Alt", "P")
         return
     LastTextInputTick := A_TickCount
+    LastAnchorActivityTick := LastTextInputTick
+    AnchorProbePending := true
 }
 
 GetImeTextInputKeyList() {
@@ -851,32 +876,16 @@ IsJapaneseImeMode(mode) {
 
 EndTrackedImeConversion() {
     global TrackedImeConversionTick := 0, DetectedImeConversionTick := 0
+        , LastAnchorActivityTick, AnchorProbePending
+    LastAnchorActivityTick := A_TickCount
+    AnchorProbePending := true
     RequestImeMonitor()
 }
 
 RefreshClickedElement() {
-    global lastClickX, lastClickY, lastClickScore, lastClickTick
-        , UiaCircuitOpenUntil, UiaCircuitSlowMs, UiaCircuitCooldownMs
-    context := DetectInputContext()
-    if A_TickCount < UiaCircuitOpenUntil
-        return
-    started := PerformanceNow()
-    try {
-        ; Chromium accessibility の有効化と UIAv2.ahk の activatedHwnds への追加を行わない
-        clickedElement := UIA.ElementFromPoint(lastClickX, lastClickY, , false)
-        lastClickScore := GetUIAEditScore(clickedElement, true, context)
-        ; クリック点が装飾要素でも、フォーカス要素が入力可能なら共通のクリック証拠として扱う
-        try lastClickScore := Max(lastClickScore
-            , GetUIAEditScore(UIA.GetFocusedElement(), false, context))
-        lastClickTick := A_TickCount
-    } catch {
-        lastClickScore := 0
-    } finally {
-        elapsedMs := PerformanceElapsedMs(started)
-        if elapsedMs >= UiaCircuitSlowMs
-            UiaCircuitOpenUntil := A_TickCount + UiaCircuitCooldownMs
-        QueueSlowPerformance(context, "UIA取得", elapsedMs, "ClickedElement", false)
-    }
+    global AnchorProbePending
+    ; クリック点UIAとフォーカスUIAを重複取得せず、次の監視サイクルへ1回だけ集約する
+    AnchorProbePending := true
     RequestImeMonitor()
 }
 
@@ -959,6 +968,7 @@ ShowImeMode() {
     try {
         MonitorCycleId += 1
         context := DetectInputContext()
+        PrepareAnchorContext(context)
         imeSnapshot := CaptureImeSnapshot(context)
         ApplyPendingImeInput(imeSnapshot)
         DiagnoseConversionSignals(context, imeSnapshot)
@@ -1403,6 +1413,39 @@ TryGetMsaaCaretAnchor(context) {
     }
 }
 
+TryResolveMsaaAnchor(context) {
+    global AnchorConfidence, MsaaCircuitOpenUntil, MsaaCircuitSlowCount
+        , MsaaCircuitSlowMs, MsaaCircuitBaseCooldownMs, MsaaCircuitMaxCooldownMs
+    if A_TickCount < MsaaCircuitOpenUntil
+        return CreateAnchorResult(, , , "MSAACaret", AnchorConfidence.Invalid
+            , true, "MSAACircuitOpen", , context.hwnd)
+
+    started := PerformanceNow()
+    result := CreateAnchorResult(, , , "MSAACaret", AnchorConfidence.Invalid
+        , true, "MSAAUnavailable", , context.hwnd)
+    try result := TryGetMsaaCaretAnchor(context)
+    finally {
+        elapsedMs := PerformanceElapsedMs(started)
+        UpdateSlowProbeCircuit(&MsaaCircuitOpenUntil, &MsaaCircuitSlowCount
+            , elapsedMs, MsaaCircuitSlowMs
+            , MsaaCircuitBaseCooldownMs, MsaaCircuitMaxCooldownMs)
+        QueueSlowPerformance(context, "MSAA取得", elapsedMs, result.source, false)
+    }
+    return result
+}
+
+UpdateSlowProbeCircuit(&openUntil, &slowCount, elapsedMs
+    , slowThresholdMs, baseCooldownMs, maxCooldownMs) {
+    if elapsedMs >= slowThresholdMs {
+        slowCount := Min(slowCount + 1, 6)
+        cooldownMs := Min(maxCooldownMs, baseCooldownMs * (2 ** (slowCount - 1)))
+        openUntil := A_TickCount + cooldownMs
+        return
+    }
+    if elapsedMs < slowThresholdMs / 2
+        slowCount := 0
+}
+
 ValidateMsaaCaret(context, focusHwnd, x, y, width, height) {
     if !focusHwnd
         return "FocusWindowUnavailable"
@@ -1442,6 +1485,37 @@ TryGetGuiThreadCaretAnchor(context) {
     y := NumGet(point, 4, "Int")
     return CreateAnchorResult(true, x + Max(right - left, 0), y
         , "GUIThreadCaret", AnchorConfidence.Exact, false, , , context.hwnd)
+}
+
+PrepareAnchorContext(context) {
+    global AnchorContextHwnd, AnchorContextFocusHwnd, AnchorProbePending
+        , AnchorProbeNotBeforeTick, LastAnchorProbeTick, TooltipAnchorVersion
+        , LastGoodAnchor, lastClickScore, lastClickWindow
+        , UiaCircuitOpenUntil, UiaCircuitSlowCount
+        , MsaaCircuitOpenUntil, MsaaCircuitSlowCount
+    if !AnchorContextHwnd {
+        AnchorContextHwnd := context.hwnd
+        AnchorContextFocusHwnd := context.focusHwnd
+        AnchorProbePending := true
+        return
+    }
+    if AnchorContextHwnd = context.hwnd
+        && AnchorContextFocusHwnd = context.focusHwnd
+        return
+
+    AnchorContextHwnd := context.hwnd
+    AnchorContextFocusHwnd := context.focusHwnd
+    AnchorProbePending := true
+    AnchorProbeNotBeforeTick := 0
+    LastAnchorProbeTick := 0
+    UiaCircuitOpenUntil := 0
+    UiaCircuitSlowCount := 0
+    MsaaCircuitOpenUntil := 0
+    MsaaCircuitSlowCount := 0
+    TooltipAnchorVersion += 1
+    LastGoodAnchor := ""
+    if IsSet(lastClickWindow) && GetRootWindowHwnd(lastClickWindow) != context.hwnd
+        lastClickScore := 0
 }
 
 DetectInputContext() {
@@ -1534,40 +1608,121 @@ GetFocusedElementCached() {
 
 ResolveAnchor(context) {
     global AnchorConfidence, CaretPositionIsFallback
+        , AnchorProbePending, LastAnchorProbeTick
+    if !context.hwnd
+        return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
+            , true, "ActiveWindowUnavailable")
+
     if CaretGetPos(&caretX, &caretY) {
+        AnchorProbePending := false
         CaretPositionIsFallback := false
         return CreateAnchorResult(true, caretX, caretY, "NativeCaret"
             , AnchorConfidence.Exact, false, , , context.hwnd)
     }
 
-    msaaAnchor := TryGetMsaaCaretAnchor(context)
-    if msaaAnchor.found
-        return msaaAnchor
+    guiThreadAnchor := TryGetGuiThreadCaretAnchor(context)
+    if guiThreadAnchor.found {
+        AnchorProbePending := false
+        return guiThreadAnchor
+    }
+
+    if !ShouldRunHeavyAnchorProbe(context)
+        return ResolveDeferredAnchor(context, "AnchorProbeDeferred")
+
+    LastAnchorProbeTick := A_TickCount
+    msaaAnchor := TryResolveMsaaAnchor(context)
+    if msaaAnchor.found {
+        AnchorProbePending := false
+        return SelectStableAnchor(context, msaaAnchor)
+    }
 
     uiaAnchor := TryResolveUiaAnchor(context)
-    if uiaAnchor.found && uiaAnchor.confidence = AnchorConfidence.Exact
+    AnchorProbePending := msaaAnchor.reason = "MSAACircuitOpen"
+        || uiaAnchor.reason = "UIACircuitOpen"
+    if AnchorProbePending
+        ScheduleAnchorProbeAfterCircuit(msaaAnchor, uiaAnchor)
+    if uiaAnchor.reason = "FocusedElementNotEditable" {
+        AnchorProbePending := false
+        InvalidateStableAnchor(context)
         return uiaAnchor
+    }
+    if uiaAnchor.found {
+        AnchorProbePending := false
+        return SelectStableAnchor(context, uiaAnchor)
+    }
 
-    guiThreadAnchor := TryGetGuiThreadCaretAnchor(context)
-    if guiThreadAnchor.found
-        return guiThreadAnchor
-
-    ; 空欄入力欄の矩形から求めた安定位置は、クリック位置による最終フォールバックより優先する
-    if uiaAnchor.found && uiaAnchor.source = "UIAEmptyInputField"
-        return uiaAnchor
-
-    ; 非編集要素にフォーカスが移った後まで、同じウィンドウ内の古いクリック位置を引き継がない
-    if uiaAnchor.reason = "FocusedElementNotEditable"
-        return uiaAnchor
+    stableAnchor := GetReusableAnchor(context, uiaAnchor.reason)
+    if stableAnchor.found
+        return stableAnchor
 
     pointerAnchor := TryGetPointerFallbackAnchor(context, uiaAnchor.reason)
     if pointerAnchor.found
-        return pointerAnchor
-
-    ; 有効な直近クリックがない場合だけ、UIAの推定値を最後の候補として残す
-    if uiaAnchor.found
-        return uiaAnchor
+        return SelectStableAnchor(context, pointerAnchor)
     return uiaAnchor
+}
+
+ScheduleAnchorProbeAfterCircuit(msaaAnchor, uiaAnchor) {
+    global AnchorProbeNotBeforeTick, MsaaCircuitOpenUntil, UiaCircuitOpenUntil
+    retryTick := 0
+    if msaaAnchor.reason = "MSAACircuitOpen"
+        retryTick := MsaaCircuitOpenUntil
+    if uiaAnchor.reason = "UIACircuitOpen"
+        retryTick := retryTick ? Min(retryTick, UiaCircuitOpenUntil) : UiaCircuitOpenUntil
+    if retryTick
+        AnchorProbeNotBeforeTick := Max(AnchorProbeNotBeforeTick, retryTick)
+}
+
+ShouldRunHeavyAnchorProbe(context) {
+    global AnchorProbePending, AnchorProbeNotBeforeTick, LastAnchorActivityTick
+        , LastAnchorProbeTick, AnchorProbeQuietMs
+        , ChromiumAnchorProbeMinIntervalMs, DefaultAnchorProbeMinIntervalMs
+    if !AnchorProbePending
+        return false
+    if A_TickCount < AnchorProbeNotBeforeTick
+        return false
+    if LastAnchorActivityTick
+        && A_TickCount - LastAnchorActivityTick < AnchorProbeQuietMs
+        return false
+    minInterval := context.isChromium
+        ? ChromiumAnchorProbeMinIntervalMs : DefaultAnchorProbeMinIntervalMs
+    return !LastAnchorProbeTick
+        || A_TickCount - LastAnchorProbeTick >= minInterval
+}
+
+ResolveDeferredAnchor(context, reason) {
+    stableAnchor := GetReusableAnchor(context, reason)
+    if stableAnchor.found
+        return stableAnchor
+    pointerAnchor := TryGetPointerFallbackAnchor(context, reason)
+    if pointerAnchor.found
+        return pointerAnchor
+    return CreateAnchorResult(, , , "None", "Invalid", true, reason, , context.hwnd)
+}
+
+SelectStableAnchor(context, candidate) {
+    stableAnchor := GetReusableAnchor(context, "LowerConfidenceCandidate")
+    if !stableAnchor.found || GetAnchorConfidenceRank(candidate.confidence)
+        >= GetAnchorConfidenceRank(stableAnchor.confidence)
+        return candidate
+    return stableAnchor
+}
+
+GetAnchorConfidenceRank(confidence) {
+    global AnchorConfidence
+    if confidence = AnchorConfidence.Exact
+        return 3
+    if confidence = AnchorConfidence.Estimated
+        return 2
+    if confidence = AnchorConfidence.Fallback
+        return 1
+    return 0
+}
+
+InvalidateStableAnchor(context) {
+    global LastGoodAnchor
+    if IsSet(LastGoodAnchor) && IsObject(LastGoodAnchor)
+        && LastGoodAnchor.hwnd = context.hwnd
+        LastGoodAnchor := ""
 }
 
 TryGetPointerFallbackAnchor(context, reason := "AnchorUnavailable") {
@@ -1593,16 +1748,13 @@ GetRootWindowHwnd(hwnd) {
 }
 
 TryResolveUiaAnchor(context) {
-    global AnchorConfidence, CaretPositionIsFallback
+    global AnchorConfidence, CaretPositionIsFallback, EditableScoreThreshold
         , LastUIASource, LastUIAConfidence, LastUIADepth, LastUIAReason
-        , UiaCircuitOpenUntil, UiaCircuitSlowMs, UiaCircuitCooldownMs
-    if A_TickCount < UiaCircuitOpenUntil {
-        reusableAnchor := GetReusableAnchor(context, "UIACircuitOpen")
-        if reusableAnchor.found
-            return reusableAnchor
+        , UiaCircuitOpenUntil, UiaCircuitSlowMs, UiaCircuitSlowCount
+        , UiaCircuitBaseCooldownMs, UiaCircuitMaxCooldownMs
+    if A_TickCount < UiaCircuitOpenUntil
         return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
             , true, "UIACircuitOpen", , context.hwnd)
-    }
 
     started := PerformanceNow()
     result := CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
@@ -1611,7 +1763,9 @@ TryResolveUiaAnchor(context) {
         focusedElement := GetFocusedElementCached()
         if focusedElement {
             runtimeId := GetElementRuntimeId(focusedElement)
-            if !IsUIAElementEditable(focusedElement, context) {
+            editScore := GetUIAEditScore(focusedElement, false, context)
+            UpdateRecentClickEvidenceFromFocusedElement(context, editScore)
+            if editScore < EditableScoreThreshold {
                 result := CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
                     , true, "FocusedElementNotEditable", , context.hwnd, runtimeId)
             } else if GetUIACaretPos(focusedElement, &caretX, &caretY, context) {
@@ -1629,22 +1783,44 @@ TryResolveUiaAnchor(context) {
             , true, "FocusedElementUnavailable", , context.hwnd)
     } finally {
         elapsedMs := PerformanceElapsedMs(started)
-        if elapsedMs >= UiaCircuitSlowMs
-            UiaCircuitOpenUntil := A_TickCount + UiaCircuitCooldownMs
+        UpdateSlowProbeCircuit(&UiaCircuitOpenUntil, &UiaCircuitSlowCount
+            , elapsedMs, UiaCircuitSlowMs
+            , UiaCircuitBaseCooldownMs, UiaCircuitMaxCooldownMs)
         QueueSlowPerformance(context, "UIA取得", elapsedMs, result.source, false)
     }
     return result
+}
+
+UpdateRecentClickEvidenceFromFocusedElement(context, editScore) {
+    global EditableScoreThreshold, lastClickScore, lastClickTick, lastClickWindow
+    if !IsSet(lastClickTick) || A_TickCount - lastClickTick > 300000
+        return
+    if !IsSet(lastClickWindow)
+        return
+    if GetRootWindowHwnd(lastClickWindow) != context.hwnd
+        return
+    lastClickScore := editScore >= EditableScoreThreshold ? editScore : 0
 }
 
 RememberGoodAnchor(anchor, context) {
     global LastGoodAnchor, TooltipAnchorVersion
     if anchor.source = "CachedAnchor"
         return
+    if IsSet(LastGoodAnchor) && IsObject(LastGoodAnchor)
+        && LastGoodAnchor.hwnd = context.hwnd
+        && LastGoodAnchor.focusHwnd = context.focusHwnd
+        && LastGoodAnchor.anchorVersion = TooltipAnchorVersion
+        && GetAnchorConfidenceRank(anchor.confidence)
+            < GetAnchorConfidenceRank(LastGoodAnchor.confidence)
+        return
     LastGoodAnchor := {
         x: anchor.x,
         y: anchor.y,
+        source: anchor.source,
         confidence: anchor.confidence,
         isFallback: anchor.isFallback,
+        reason: anchor.reason,
+        runtimeId: anchor.runtimeId,
         hwnd: context.hwnd,
         focusHwnd: context.focusHwnd,
         anchorVersion: TooltipAnchorVersion,
@@ -1653,24 +1829,17 @@ RememberGoodAnchor(anchor, context) {
 }
 
 GetReusableAnchor(context, reason) {
-    global AnchorConfidence, LastGoodAnchor, TooltipAnchorVersion, UiaAnchorReuseMs
-    if IsSet(LastGoodAnchor)
+    global AnchorConfidence, LastGoodAnchor, TooltipAnchorVersion
+    if IsSet(LastGoodAnchor) && IsObject(LastGoodAnchor)
         && LastGoodAnchor.hwnd = context.hwnd
         && LastGoodAnchor.focusHwnd = context.focusHwnd
-        && LastGoodAnchor.anchorVersion = TooltipAnchorVersion
-        && A_TickCount - LastGoodAnchor.capturedTick <= UiaAnchorReuseMs {
+        && LastGoodAnchor.anchorVersion = TooltipAnchorVersion {
         return CreateAnchorResult(true, LastGoodAnchor.x, LastGoodAnchor.y
             , "CachedAnchor", LastGoodAnchor.confidence, LastGoodAnchor.isFallback
-            , reason, , context.hwnd)
+            , reason, , context.hwnd, LastGoodAnchor.runtimeId)
     }
     return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
         , true, reason, , context.hwnd)
-}
-
-IsUIAElementEditable(element, context) {
-    global EditableScoreThreshold
-    score := GetUIAEditScore(element, false, context)
-    return score >= EditableScoreThreshold
 }
 
 GetUIAEditScore(element, isClickedElement := false, context := unset) {
