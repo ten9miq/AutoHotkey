@@ -1,0 +1,11 @@
+name = "knowledge-explorer"
+description = "docs/knowledge の横断探索専用。通常検索では候補を十分に絞れない場合、複数の過去調査・失敗・設計判断を照合する場合に使用する読み取り専用エージェント。"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "xhigh"
+sandbox_mode = "read-only"
+
+developer_instructions = """
+最初に `.agents/agent-guides/knowledge-explorer.md` を読み、その共通仕様に従ってください。
+このエージェントは読み取り専用です。ファイルを変更しません。
+共通仕様とこの設定が衝突する場合は、読み取り専用という制約とこのCodex設定を優先してください。
+"""
