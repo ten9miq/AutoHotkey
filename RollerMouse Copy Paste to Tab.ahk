@@ -50,7 +50,7 @@ RegisterRawInput(usage, hwnd) {
 
     NumPut("UShort", 0x01, rid, 0)
     NumPut("UShort", usage, rid, 2)
-    NumPut("UInt", 0x00000100, rid, 4) ; RIDEV_INPUTSINK
+    NumPut("UInt", 0x00000100, rid, 4)  ; RIDEV_INPUTSINK
     NumPut("Ptr", hwnd, rid, 8)
 
     return DllCall("user32\RegisterRawInputDevices"
@@ -63,13 +63,13 @@ RegisterRawInput(usage, hwnd) {
 
 QueueChord(name) {
     global gPending, gTargetCtrlDown, gLastTargetKeyDownTick, gRawInputDetectionWindow
+
     Critical()
     fromTarget := gTargetCtrlDown
         || ((A_TickCount - gLastTargetKeyDownTick) <= gRawInputDetectionWindow)
     gPending.Push({name: name, tick: A_TickCount, fromTarget: fromTarget})
     SetTimer ProcessPendingChords, 10
 }
-
 
 
 ProcessPendingChords() {
@@ -134,13 +134,12 @@ FindTargetKeyCounterpart(pending) {
 
 
 SendCloseTabByKeys() {
-    SendInput "{c up}{v up}{Ctrl up}{Shift up}"
-    SendInput "{Ctrl down}{F4 down}{F4 up}{Ctrl up}"
+    SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{F4 down}{F4 up}{Ctrl up}"
 }
 
 
 SendCloseTabByMouse() {
-    SendInput "{Ctrl down}{F4 down}{F4 up}{Ctrl up}"
+    SendInput "{Blind}{Ctrl down}{F4 down}{F4 up}{Ctrl up}"
 }
 
 
@@ -150,14 +149,13 @@ DismissContextMenu() {
 
 
 SendTabChord(sourceKey) {
-    ; RollerMouse側のCtrlが物理的に押されたままでも、修飾キーを確実に組み直す。
-    SendInput "{c up}{v up}{Ctrl up}{Shift up}"
+    ; Blindモードで、物理Ctrlが押下中でも送信後の自動再押下を防ぐ。
 
     if (sourceKey = "C") {
-        SendInput "{Ctrl down}{Shift down}{Tab down}{Tab up}{Shift up}{Ctrl up}"
+        SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Shift down}{Tab down}{Tab up}{Shift up}{Ctrl up}"
         ; TrayTip, RollerMouse Remap, Copy -> Ctrl+Shift+Tab, 1, 1
     } else {
-        SendInput "{Ctrl down}{Tab down}{Tab up}{Ctrl up}"
+        SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Tab down}{Tab up}{Ctrl up}"
         ; TrayTip, RollerMouse Remap, Paste -> Ctrl+Tab, 1, 1
     }
 }
