@@ -8,6 +8,8 @@ SendMode "Input"
 global gTargetDevicePatterns := ["VID_0B33&PID_3022","VID_0B33&PID_2000"]
 
 global gDevices := Map()
+; 対象/非対象の判定結果をデバイスハンドル単位でキャッシュし、高頻度なマウス移動イベントでの再判定を避ける。
+global gDeviceIsTarget := Map()
 ; 対象デバイスのCtrl押下状態。RollerMouseはチョード中Ctrlを押しっぱなしにするため、これが最も確実な入力元判定になる。
 global gTargetCtrlDown := false
 ; 対象デバイス由来のCtrl活動時刻（down/up）。押下状態判定を補う順序ゆらぎ対策。
@@ -29,10 +31,10 @@ global gRawInputBuffer := Buffer((8 + 2 * A_PtrSize) + 64, 0)
 rollerMouseGui := Gui("+ToolWindow", "RollerMouse Remap")
 rollerMouseGui.Show("Hide")
 
-OnMessage(0x00FF, OnRawInput)
+OnMessage(0x00FF, OnRawInput)  ; WM_INPUT
 
-if (!RegisterRawInput(0x06, rollerMouseGui.Hwnd)
-    || !RegisterRawInput(0x02, rollerMouseGui.Hwnd)) {
+if (!RegisterRawInput(0x06, rollerMouseGui.Hwnd)  ; Generic Desktop / Keyboard
+    || !RegisterRawInput(0x02, rollerMouseGui.Hwnd)) {  ; Generic Desktop / Mouse
     MsgBox "Raw Inputの登録に失敗しました。", "RollerMouse Remap", "Iconx"
     ExitApp
 }
@@ -40,15 +42,29 @@ if (!RegisterRawInput(0x06, rollerMouseGui.Hwnd)
 ; タイマーは常時回さず、キューに投入された時だけ起動する（QueueChord内で開始）。
 
 
+#HotIf IsTargetCtrlActive()
 $^c::QueueChord("C")
 $^v::QueueChord("V")
+; Shift同時押しでもRollerMouse側の入力を捕捉する（素通りでコピー/ペーストが動くのを防ぐ）。
+$^+c::QueueChord("C")
+$^+v::QueueChord("V")
+#HotIf
+
+
+IsTargetCtrlActive() {
+    global gTargetCtrlDown, gLastTargetKeyDownTick, gRawInputDetectionWindow
+
+    return gTargetCtrlDown
+        || (gLastTargetKeyDownTick != 0
+            && Abs(A_TickCount - gLastTargetKeyDownTick) <= gRawInputDetectionWindow)
+}
 
 
 RegisterRawInput(usage, hwnd) {
     ridSize := 8 + A_PtrSize
     rid := Buffer(ridSize, 0)
 
-    NumPut("UShort", 0x01, rid, 0)
+    NumPut("UShort", 0x01, rid, 0)  ; usUsagePage = Generic Desktop
     NumPut("UShort", usage, rid, 2)
     NumPut("UInt", 0x00000100, rid, 4)  ; RIDEV_INPUTSINK
     NumPut("Ptr", hwnd, rid, 8)
@@ -62,18 +78,17 @@ RegisterRawInput(usage, hwnd) {
 
 
 QueueChord(name) {
-    global gPending, gTargetCtrlDown, gLastTargetKeyDownTick, gRawInputDetectionWindow
+    global gPending
 
     Critical()
-    fromTarget := gTargetCtrlDown
-        || ((A_TickCount - gLastTargetKeyDownTick) <= gRawInputDetectionWindow)
+    fromTarget := IsTargetCtrlActive()
     gPending.Push({name: name, tick: A_TickCount, fromTarget: fromTarget})
     SetTimer ProcessPendingChords, 10
 }
 
 
 ProcessPendingChords() {
-    global gPending, gTargetCtrlDown, gLastTargetKeyDownTick, gRawInputDetectionWindow, gKeyChordWindow
+    global gPending, gKeyChordWindow
 
     Critical()
 
@@ -81,9 +96,7 @@ ProcessPendingChords() {
         pending := gPending[1]
 
         ; WM_INPUTがホットキー処理より後に届く場合を待つ。
-        fromTarget := pending.fromTarget
-            || gTargetCtrlDown
-            || Abs(gLastTargetKeyDownTick - pending.tick) <= gRawInputDetectionWindow
+        fromTarget := IsChordFromTarget(pending)
         waitTime := fromTarget ? gKeyChordWindow : 30
         if ((A_TickCount - pending.tick) < waitTime)
             return
@@ -115,21 +128,27 @@ ProcessPendingChords() {
 
 
 FindTargetKeyCounterpart(pending) {
-    global gPending, gTargetCtrlDown, gLastTargetKeyDownTick
-    global gRawInputDetectionWindow, gKeyChordWindow
+    global gPending, gKeyChordWindow
 
     for index, candidate in gPending {
-        candidateFromTarget := candidate.fromTarget
-            || gTargetCtrlDown
-            || Abs(gLastTargetKeyDownTick - candidate.tick) <= gRawInputDetectionWindow
         if (index != 1
-            && candidateFromTarget
+            && IsChordFromTarget(candidate)
             && candidate.name != pending.name
             && Abs(candidate.tick - pending.tick) <= gKeyChordWindow)
             return index
     }
 
     return 0
+}
+
+
+; キュー内の1件が対象デバイス由来かを判定する（フラグ、現在のCtrl押下状態、時刻のゆらぎの3要素）。
+IsChordFromTarget(entry) {
+    global gTargetCtrlDown, gLastTargetKeyDownTick, gRawInputDetectionWindow
+
+    return entry.fromTarget
+        || gTargetCtrlDown
+        || Abs(gLastTargetKeyDownTick - entry.tick) <= gRawInputDetectionWindow
 }
 
 
@@ -150,19 +169,22 @@ DismissContextMenu() {
 
 SendTabChord(sourceKey) {
     ; Blindモードで、物理Ctrlが押下中でも送信後の自動再押下を防ぐ。
+    ; Shiftはupを送らず物理状態を維持し、同時押し時はシート切替ショートカットになる。
 
     if (sourceKey = "C") {
-        SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Shift down}{Tab down}{Tab up}{Shift up}{Ctrl up}"
+        ; SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Shift down}{Tab down}{Tab up}{Shift up}{Ctrl up}"
         ; TrayTip, RollerMouse Remap, Copy -> Ctrl+Shift+Tab, 1, 1
+        SendInput "{Blind}{c up}{v up}{Ctrl up}{Ctrl down}{PgUp down}{PgUp up}{Ctrl up}"
     } else {
-        SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Tab down}{Tab up}{Ctrl up}"
+        ; SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Tab down}{Tab up}{Ctrl up}"
         ; TrayTip, RollerMouse Remap, Paste -> Ctrl+Tab, 1, 1
+        SendInput "{Blind}{c up}{v up}{Ctrl up}{Ctrl down}{PgDn down}{PgDn up}{Ctrl up}"
     }
 }
 
 
 OnRawInput(wParam, lParam, msg, hwnd) {
-    global gDevices, gTargetCtrlDown, gLastTargetKeyDownTick
+    global gDevices, gDeviceIsTarget, gTargetCtrlDown, gLastTargetKeyDownTick
     global gLeftButtonDown, gRightButtonDown, gMouseChordTriggered
     global gLeftButtonDownTick, gRightButtonDownTick, gMouseChordWindow
     global gRawInputBuffer
@@ -176,7 +198,7 @@ OnRawInput(wParam, lParam, msg, hwnd) {
     ; 事前確保した固定バッファへ直接取得し、サイズ照会用のDllCallを省いて呼び出しを半減させる。
     result := DllCall("user32\GetRawInputData"
         , "Ptr", lParam
-        , "UInt", 0x10000003
+        , "UInt", 0x10000003  ; RID_INPUT
         , "Ptr", raw
         , "UInt*", &size
         , "UInt", headerSize
@@ -187,18 +209,24 @@ OnRawInput(wParam, lParam, msg, hwnd) {
 
     type := NumGet(raw, 0, "UInt")
     hDevice := NumGet(raw, 8, "Ptr")
-    deviceKey := "" hDevice
 
-    if (!gDevices.Has(deviceKey))
-        gDevices[deviceKey] := GetDevicePath(hDevice)
+    ; ハンドル単位で初回だけパス取得と対象判定を行い、以降はキャッシュ参照で済ませる。
+    if (!gDeviceIsTarget.Has(hDevice)) {
+        gDevices[hDevice] := GetDevicePath(hDevice)
+        gDeviceIsTarget[hDevice] := IsTargetDevice(hDevice)
+    }
 
-    if (!IsTargetDevice(deviceKey))
+    if (!gDeviceIsTarget[hDevice])
         return
 
     dataOffset := headerSize
 
     if (type = 0) {
         buttonFlags := NumGet(raw, dataOffset + 4, "UShort")
+
+        ; 移動のみのイベント（ボタンフラグ無し）はチョード判定不要なので即戻る。
+        if (buttonFlags = 0)
+            return
 
         if (buttonFlags & 0x0001) {
             gLeftButtonDown := true
@@ -248,7 +276,7 @@ GetDevicePath(hDevice) {
 
     DllCall("user32\GetRawInputDeviceInfoW"
         , "Ptr", hDevice
-        , "UInt", 0x20000007
+        , "UInt", 0x20000007  ; RIDI_DEVICENAME
         , "Ptr", 0
         , "UInt*", &chars
         , "UInt")
@@ -259,7 +287,7 @@ GetDevicePath(hDevice) {
     nameBuffer := Buffer((chars + 1) * 2, 0)
     result := DllCall("user32\GetRawInputDeviceInfoW"
         , "Ptr", hDevice
-        , "UInt", 0x20000007
+        , "UInt", 0x20000007  ; RIDI_DEVICENAME
         , "Ptr", nameBuffer
         , "UInt*", &chars
         , "UInt")
