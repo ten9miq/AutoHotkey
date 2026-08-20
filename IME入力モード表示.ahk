@@ -9,8 +9,6 @@ A_MaxHotkeysPerInterval := 200
 
 EditableScoreThreshold := 7
 TooltipIdleTimeout := 1000
-ConversionDetectionHoldMs := 10000
-ImeConversionHoldMs := 10000
 MonitorCycleId := 0
 TooltipAnchorVersion := 0
 MonitorRunning := false
@@ -20,12 +18,6 @@ MonitorNextDueTick := 0
 ImeCircuitOpenUntil := 0
 UiaCircuitOpenUntil := 0
 MsaaCircuitOpenUntil := 0
-TrackedImeConversionTick := 0
-DetectedImeConversionTick := 0
-LastTextInputTick := 0
-LastHandledTextInputTick := 0
-LastConversionKeyTick := 0
-LastHandledConversionKeyTick := 0
 LastAnchorActivityTick := 0
 LastAnchorProbeTick := 0
 AnchorProbeNotBeforeTick := 0
@@ -45,11 +37,18 @@ MsaaCircuitBaseCooldownMs := 1000
 MsaaCircuitMaxCooldownMs := 30000
 MsaaCircuitSlowCount := 0
 AnchorProbeQuietMs := 120
-ChromiumAnchorProbeMinIntervalMs := 250
-DefaultAnchorProbeMinIntervalMs := 120
+ChromiumAnchorProbeMinIntervalMs := 120
+DefaultAnchorProbeMinIntervalMs := 75
+PostInputAnchorFirstDelayMs := 35
+PostInputAnchorRetryMax := 4
+PostInputAnchorRetryCount := 0
+PostInputAnchorRetryNextTick := 0
+PostInputAnchorProbeDue := false
 InputContextCacheMs := 1000
 IndicatorOffsetX := -70 ; 負数で左、正数で右
 IndicatorOffsetY := 36  ; 負数で上、正数で下
+IndicatorWidth := 22
+IndicatorHeight := 20
 IndicatorColorAlphanumeric := "1677FF"
 IndicatorColorJapanese := "FF3B30"
 IndicatorColorHalfKatakana := "FF8A00"
@@ -134,6 +133,7 @@ CoordMode "Mouse", "Screen"
 
 UIA.SetMaximumDPIAwareness()
 CreateImeIndicator()
+OnMessage(0x02E0, HandleImeIndicatorDpiChanged) ; WM_DPICHANGED
 InitializeImeKeyTracking()
 InitializeImeMonitor()
 InitializeViewportDiagnostics()
@@ -143,9 +143,7 @@ InitializeViewportDiagnostics()
 ~*WheelDown::MarkViewportInput("WheelDown")
 ~*WheelLeft::MarkViewportInput("WheelLeft")
 ~*WheelRight::MarkViewportInput("WheelRight")
-~*Space::TrackImeConversionKey()
-~*Enter::EndTrackedImeConversion()
-~*Esc::EndTrackedImeConversion()
+~*Space::TrackSpaceInput()
 
 ; --- 診断・計測用ホットキー（本体機能とは独立） ---
 ^!F9::CaptureFocusedCaretInfo()
@@ -999,13 +997,10 @@ LogAnchorDiagnostic(anchor, isConverting, displayState) {
 ; 候補検出一本化の可否を検証するため、各信号を独立に計測して記録する
 DiagnoseConversionSignals(context, imeSnapshot) {
     global DiagnosticEnabled, DiagnosticDeepUiaEnabled, DiagnosticLogPath
-        , ImeConversionHoldMs, TrackedImeConversionTick
     static lastSignature := ""
     if !DiagnosticEnabled
         return
 
-    trackerActive := (IsSet(TrackedImeConversionTick) && TrackedImeConversionTick
-        && A_TickCount - TrackedImeConversionTick <= ImeConversionHoldMs) ? 1 : 0
     immOpen := imeSnapshot.valid ? (imeSnapshot.open ? 1 : 0) : -1
     converting := imeSnapshot.valid ? imeSnapshot.converting : -1
     hasCandidate := converting = 2 ? 1 : (converting >= 0 ? 0 : -1)
@@ -1013,16 +1008,16 @@ DiagnoseConversionSignals(context, imeSnapshot) {
     processName := context.processName != "" ? context.processName : "unknown"
 
     ; 何も起きていないアイドルは1行にまとめてノイズを抑える
-    if !trackerActive && converting <= 0 && hasCandidate <= 0 && uiaComposition <= 0 && immOpen <= 0
+    if converting <= 0 && hasCandidate <= 0 && uiaComposition <= 0 && immOpen <= 0
         signature := "idle|" processName
     else
-        signature := trackerActive "|" immOpen "|" converting "|" hasCandidate "|" uiaComposition "|" processName
+        signature := immOpen "|" converting "|" hasCandidate "|" uiaComposition "|" processName
     if signature = lastSignature
         return
     lastSignature := signature
 
     line := (FormatTime(, "yyyy-MM-dd HH:mm:ss.fff") "`tCONV`t" processName
-        . "`ttracker=" trackerActive "`timmOpen=" immOpen "`tconverting=" converting
+        . "`timmOpen=" immOpen "`tconverting=" converting
         . "`thasCandidate=" hasCandidate "`tuiaComposition=" uiaComposition "`n")
     AppendLogWithRetry(DiagnosticLogPath, line)
 }
@@ -1058,8 +1053,8 @@ DetectUIACompositionSignal() {
 ; ============================================================================
 
 RememberCaretClickPosition() {
-    global LastClickEventTick, TrackedImeConversionTick, DetectedImeConversionTick
-        , LastAnchorActivityTick, AnchorProbeNotBeforeTick, AnchorProbePending
+    global LastClickEventTick, LastAnchorActivityTick
+        , AnchorProbeNotBeforeTick, AnchorProbePending
         , ImeStateDirty, CaretStateDirty
     LastClickEventTick := A_TickCount
     LastAnchorActivityTick := LastClickEventTick
@@ -1067,8 +1062,6 @@ RememberCaretClickPosition() {
     AnchorProbePending := true
     ImeStateDirty := true
     CaretStateDirty := true
-    TrackedImeConversionTick := 0
-    DetectedImeConversionTick := 0
     RearmViewportCaretReacquire(LastClickEventTick)
     SetTimer CaptureCaretClickEvidence, -1
     RequestImeMonitor()
@@ -1084,15 +1077,15 @@ CaptureCaretClickEvidence() {
     SetTimer RefreshClickedElement, -150
 }
 
-TrackImeConversionKey() {
-    global LastConversionKeyTick, LastAnchorActivityTick, AnchorProbePending
+TrackSpaceInput() {
+    global LastAnchorActivityTick, AnchorProbePending
         , ImeStateDirty, CaretStateDirty
-    LastConversionKeyTick := A_TickCount
-    LastAnchorActivityTick := LastConversionKeyTick
+    LastAnchorActivityTick := A_TickCount
     AnchorProbePending := true
     ImeStateDirty := true
     CaretStateDirty := true
-    MarkPostViewportCaretEvidence(LastConversionKeyTick)
+    MarkPostViewportCaretEvidence(LastAnchorActivityTick)
+    ArmPostInputAnchorRetry()
     RequestImeMonitor()
 }
 
@@ -1113,7 +1106,7 @@ CleanupImeKeyTracking(*) {
 }
 
 HandleImeTextKeyDown(inputHook, virtualKey, scanCode) {
-    global LastTextInputTick, LastAnchorActivityTick, AnchorProbePending
+    global LastAnchorActivityTick, AnchorProbePending
         , ImeStateDirty, CaretStateDirty
     isViewportKey := virtualKey = 0x21 || virtualKey = 0x22
     if isViewportKey
@@ -1122,8 +1115,10 @@ HandleImeTextKeyDown(inputHook, virtualKey, scanCode) {
         LastAnchorActivityTick := A_TickCount
         AnchorProbePending := true
         CaretStateDirty := true
-        if !isViewportKey
+        if !isViewportKey {
             MarkPostViewportCaretEvidence(LastAnchorActivityTick)
+            ArmPostInputAnchorRetry()
+        }
         RequestImeMonitor()
         return
     }
@@ -1134,12 +1129,40 @@ HandleImeTextKeyDown(inputHook, virtualKey, scanCode) {
     RequestImeMonitor()
     if GetKeyState("Ctrl", "P") || GetKeyState("Alt", "P")
         return
-    LastTextInputTick := A_TickCount
-    LastAnchorActivityTick := LastTextInputTick
+    LastAnchorActivityTick := A_TickCount
     AnchorProbePending := true
     ImeStateDirty := true
     CaretStateDirty := true
-    MarkPostViewportCaretEvidence(LastTextInputTick)
+    MarkPostViewportCaretEvidence(LastAnchorActivityTick)
+    ArmPostInputAnchorRetry()
+}
+
+ArmPostInputAnchorRetry() {
+    global PostInputAnchorRetryCount, PostInputAnchorRetryNextTick
+        , PostInputAnchorFirstDelayMs
+    PostInputAnchorRetryCount := 0
+    firstRetryTick := A_TickCount + PostInputAnchorFirstDelayMs
+    if !PostInputAnchorRetryNextTick || firstRetryTick < PostInputAnchorRetryNextTick
+        PostInputAnchorRetryNextTick := firstRetryTick
+}
+
+PreparePostInputAnchorRetry(context) {
+    global AnchorProbePending, AnchorProbeNotBeforeTick
+        , PostInputAnchorRetryCount, PostInputAnchorRetryNextTick
+        , PostInputAnchorRetryMax, ChromiumAnchorProbeMinIntervalMs
+        , DefaultAnchorProbeMinIntervalMs, PostInputAnchorProbeDue
+    if !PostInputAnchorRetryNextTick
+        || PostInputAnchorRetryCount >= PostInputAnchorRetryMax
+        || A_TickCount < PostInputAnchorRetryNextTick
+        return
+    retryInterval := context.isChromium
+        ? ChromiumAnchorProbeMinIntervalMs : DefaultAnchorProbeMinIntervalMs
+    PostInputAnchorRetryCount += 1
+    PostInputAnchorRetryNextTick := PostInputAnchorRetryCount < PostInputAnchorRetryMax
+        ? A_TickCount + retryInterval : 0
+    PostInputAnchorProbeDue := true
+    AnchorProbePending := true
+    AnchorProbeNotBeforeTick := A_TickCount
 }
 
 MarkPostViewportCaretEvidence(tick) {
@@ -1185,22 +1208,6 @@ IsCaretNavigationVirtualKey(virtualKey) {
     return virtualKey = 0x08 || virtualKey = 0x09 || virtualKey = 0x0D
         || virtualKey = 0x1B || virtualKey >= 0x21 && virtualKey <= 0x28
         || virtualKey = 0x2E
-}
-
-IsJapaneseImeMode(mode) {
-    return mode = 9 || mode = 25 || mode = 11 || mode = 27
-        || mode = 3 || mode = 19
-}
-
-EndTrackedImeConversion() {
-    global TrackedImeConversionTick := 0, DetectedImeConversionTick := 0
-        , LastAnchorActivityTick, AnchorProbePending, ImeStateDirty, CaretStateDirty
-    LastAnchorActivityTick := A_TickCount
-    AnchorProbePending := true
-    ImeStateDirty := true
-    CaretStateDirty := true
-    MarkPostViewportCaretEvidence(LastAnchorActivityTick)
-    RequestImeMonitor()
 }
 
 RefreshClickedElement() {
@@ -1270,7 +1277,7 @@ RequestImeMonitor() {
 GetImeMonitorInterval() {
     global IndicatorState
     switch IndicatorState.mode {
-        case "Realtime", "Frozen":
+        case "Realtime":
             return 75
         case "Provisional":
             return 100
@@ -1291,10 +1298,10 @@ ShowImeMode() {
         MonitorCycleId += 1
         context := DetectInputContext()
         PrepareAnchorContext(context)
+        PreparePostInputAnchorRetry(context)
         imeSnapshot := CaptureImeSnapshot(context)
         if imeSnapshot.valid
             ImeStateDirty := false
-        ApplyPendingImeInput(imeSnapshot)
         DiagnoseConversionSignals(context, imeSnapshot)
         if !imeSnapshot.valid {
             CurrentAnchorResult := CreateAnchorResult(, , , "None", "Invalid"
@@ -1318,7 +1325,7 @@ ShowImeMode() {
 
         modeDisplay := GetImeModeDisplay(imeSnapshot)
         UpdateIndicatorState(context, CurrentAnchorResult, modeDisplay
-            , IsImeConversionActive(imeSnapshot))
+            , imeSnapshot.converting != 0)
     } finally {
         ClearCycleCaches()
         if cycleStarted && IsSet(context) {
@@ -1344,16 +1351,10 @@ UpdateIndicatorState(context, anchor, modeDisplay, isConverting) {
     }
 
     nextMode := anchor.confidence = AnchorConfidence.Fallback ? "Provisional" : "Realtime"
-    if isConverting
-        nextMode := "Frozen"
-
-    positionChanged := false
-    if !(isConverting && IndicatorState.mode != "Hidden" && !anchorChanged) {
-        position := CalculateIndicatorPosition(context, anchor)
-        positionChanged := position.x != IndicatorState.x || position.y != IndicatorState.y
-        IndicatorState.x := position.x
-        IndicatorState.y := position.y
-    }
+    position := CalculateIndicatorPosition(context, anchor)
+    positionChanged := position.x != IndicatorState.x || position.y != IndicatorState.y
+    IndicatorState.x := position.x
+    IndicatorState.y := position.y
 
     visualChanged := IndicatorState.mode = "Hidden"
         || IndicatorState.text != modeDisplay.text
@@ -1382,15 +1383,14 @@ IsPointerFallbackSource(source) {
 }
 
 ClampIndicatorPosition(x, y, referenceX, referenceY) {
-    indicatorWidth := 30
-    indicatorHeight := 26
+    global IndicatorWidth, IndicatorHeight
     Loop MonitorGetCount() {
         MonitorGetWorkArea A_Index, &left, &top, &right, &bottom
         if referenceX >= left && referenceX < right
             && referenceY >= top && referenceY < bottom
             return {
-                x: Min(Max(x, left + 4), right - indicatorWidth - 4),
-                y: Min(Max(y, top + 4), bottom - indicatorHeight - 4)
+                x: Min(Max(x, left + 4), right - IndicatorWidth - 4),
+                y: Min(Max(y, top + 4), bottom - IndicatorHeight - 4)
             }
     }
     return {
@@ -1516,50 +1516,6 @@ GetReusableImeSnapshot(context, timedOut, reason) {
     }
 }
 
-ApplyPendingImeInput(imeSnapshot) {
-    global LastTextInputTick, LastHandledTextInputTick
-        , LastConversionKeyTick, LastHandledConversionKeyTick, TrackedImeConversionTick
-    if !imeSnapshot.valid
-        return
-
-    latestTick := 0
-    if IsSet(LastTextInputTick)
-        && (!IsSet(LastHandledTextInputTick) || LastTextInputTick != LastHandledTextInputTick) {
-        latestTick := Max(latestTick, LastTextInputTick)
-        LastHandledTextInputTick := LastTextInputTick
-    }
-    if IsSet(LastConversionKeyTick)
-        && (!IsSet(LastHandledConversionKeyTick) || LastConversionKeyTick != LastHandledConversionKeyTick) {
-        latestTick := Max(latestTick, LastConversionKeyTick)
-        LastHandledConversionKeyTick := LastConversionKeyTick
-    }
-    if latestTick && A_TickCount - latestTick <= 1000
-        && imeSnapshot.open && IsJapaneseImeMode(imeSnapshot.convMode)
-        TrackedImeConversionTick := latestTick
-}
-
-IsImeConversionActive(imeSnapshot) {
-    global ImeConversionHoldMs, ConversionDetectionHoldMs, DetectedImeConversionTick, TrackedImeConversionTick
-    if !imeSnapshot.open {  ; IME OFFなら変換は無い。滞留トラッカーを消して即追従へ戻す
-        TrackedImeConversionTick := 0
-        DetectedImeConversionTick := 0
-        return false
-    }
-    if IsSet(TrackedImeConversionTick) && TrackedImeConversionTick
-        && A_TickCount - TrackedImeConversionTick <= ImeConversionHoldMs
-        return true
-
-    if imeSnapshot.converting != 0 {
-        DetectedImeConversionTick := A_TickCount
-        return true
-    }
-
-    if IsSet(DetectedImeConversionTick) && DetectedImeConversionTick
-        && A_TickCount - DetectedImeConversionTick <= ConversionDetectionHoldMs
-        return true
-    return false
-}
-
 ClearCycleCaches() {
     global CachedFocusedElement, CachedFocusedElementCycle
     CachedFocusedElement := ""
@@ -1567,24 +1523,38 @@ ClearCycleCaches() {
 }
 
 CreateImeIndicator() {
-    global ImeIndicatorGui, ImeIndicatorControls, ImeIndicatorCenterControl, ImeIndicatorFonts
+    global ImeIndicatorGui, ImeIndicatorControls, ImeIndicatorCenterControl
+        , IndicatorWidth, IndicatorHeight
     ImeIndicatorGui := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20 +E0x08000000")
     ImeIndicatorGui.BackColor := "010203"
     ImeIndicatorGui.MarginX := 0
     ImeIndicatorGui.MarginY := 0
     ImeIndicatorControls := []
 
-    ImeIndicatorGui.SetFont("s10 Norm cFFFFFF", "Meiryo UI")
+    ImeIndicatorGui.SetFont("s8 Norm cFFFFFF", "Meiryo UI")
     for offset in [[1, 0], [0, 1], [2, 1], [1, 2]]
         ImeIndicatorControls.Push(ImeIndicatorGui.AddText(
-            "x" offset[1] " y" offset[2] " w28 h24 Center BackgroundTrans", ""))
+            "x" offset[1] " y" offset[2] " w20 h18 Center BackgroundTrans", ""))
 
-    ImeIndicatorGui.SetFont("s10 Norm c000000", "Meiryo UI")
+    ImeIndicatorGui.SetFont("s8 Norm c000000", "Meiryo UI")
     ImeIndicatorCenterControl := ImeIndicatorGui.AddText(
-        "x1 y1 w28 h24 Center BackgroundTrans", "")
+        "x1 y1 w20 h18 Center BackgroundTrans", "")
     ImeIndicatorControls.Push(ImeIndicatorCenterControl)
 
-    fontHeight := -DllCall("MulDiv", "Int", 10, "Int", A_ScreenDPI, "Int", 72, "Int")
+    UpdateImeIndicatorFontsForDpi(A_ScreenDPI)
+
+    ImeIndicatorGui.Show("NA x-32000 y-32000 w" IndicatorWidth " h" IndicatorHeight)
+    WinSetTransColor("010203 255", "ahk_id " ImeIndicatorGui.Hwnd)
+    ImeIndicatorGui.Hide()
+    OnExit(DeleteImeIndicatorFont)
+}
+
+UpdateImeIndicatorFontsForDpi(dpi) {
+    global ImeIndicatorControls, ImeIndicatorFonts, ImeIndicatorDpi
+    if IsSet(ImeIndicatorDpi) && ImeIndicatorDpi = dpi
+        return
+
+    fontHeight := -DllCall("MulDiv", "Int", 8, "Int", dpi, "Int", 72, "Int")
     whiteFont := DllCall("gdi32\CreateFontW"
         , "Int", fontHeight, "Int", 0, "Int", 0, "Int", 0, "Int", 400
         , "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 1
@@ -1595,15 +1565,41 @@ CreateImeIndicator() {
         , "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 1
         , "UInt", 0, "UInt", 0, "UInt", 3, "UInt", 0
         , "WStr", "Meiryo UI", "Ptr")
+    if !whiteFont || !blackFont {
+        if whiteFont
+            DllCall("gdi32\DeleteObject", "Ptr", whiteFont)
+        if blackFont
+            DllCall("gdi32\DeleteObject", "Ptr", blackFont)
+        return
+    }
+
+    oldFonts := IsSet(ImeIndicatorFonts) ? ImeIndicatorFonts : []
     ImeIndicatorFonts := [whiteFont, blackFont]
     for control in ImeIndicatorControls
         SendMessage(0x30, A_Index = ImeIndicatorControls.Length ? blackFont : whiteFont
             , true, control.Hwnd)
+    for font in oldFonts
+        if font
+            DllCall("gdi32\DeleteObject", "Ptr", font)
+    ImeIndicatorDpi := dpi
+}
 
-    ImeIndicatorGui.Show("NA x-32000 y-32000 w30 h26")
-    WinSetTransColor("010203 255", "ahk_id " ImeIndicatorGui.Hwnd)
-    ImeIndicatorGui.Hide()
-    OnExit(DeleteImeIndicatorFont)
+HandleImeIndicatorDpiChanged(wParam, lParam, message, hwnd) {
+    global ImeIndicatorGui
+    if hwnd != ImeIndicatorGui.Hwnd
+        return
+    dpi := wParam & 0xFFFF
+    if dpi
+        UpdateImeIndicatorFontsForDpi(dpi)
+}
+
+RefreshImeIndicatorDpi() {
+    global ImeIndicatorGui
+    try dpi := DllCall("user32\GetDpiForWindow", "Ptr", ImeIndicatorGui.Hwnd, "UInt")
+    catch
+        dpi := A_ScreenDPI
+    if dpi
+        UpdateImeIndicatorFontsForDpi(dpi)
 }
 
 DeleteImeIndicatorFont(*) {
@@ -1615,10 +1611,12 @@ DeleteImeIndicatorFont(*) {
 
 ShowImeIndicator(modeText, color, x, y) {
     global ImeIndicatorGui, ImeIndicatorControls, ImeIndicatorCenterControl
+        , IndicatorWidth, IndicatorHeight
     for control in ImeIndicatorControls
         control.Text := modeText
     ImeIndicatorCenterControl.Opt("c" color)
-    ImeIndicatorGui.Show("NA x" x " y" y " w30 h26")
+    ImeIndicatorGui.Show("NA x" x " y" y " w" IndicatorWidth " h" IndicatorHeight)
+    RefreshImeIndicatorDpi()
     ; 最前面帯の先頭へ再挿入し、後から出た最前面窓（検索/スタート等）の裏に隠れにくくする
     DllCall("SetWindowPos", "Ptr", ImeIndicatorGui.Hwnd, "Ptr", -1
         , "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x13)
@@ -1672,20 +1670,41 @@ GetElementRuntimeId(element) {
 }
 
 GetGuiThreadCaretInfo(hwndActive) {
+    global MonitorCycleId, MonitorRunning
     static guiThreadInfo := Buffer(24 + 6 * A_PtrSize, 0)
+    static cachedCycleId := -1, cachedHwnd := 0, cachedResult := false
     if !hwndActive
         return false
+    if MonitorRunning && cachedCycleId = MonitorCycleId && cachedHwnd = hwndActive
+        return cachedResult
     threadId := DllCall("GetWindowThreadProcessId", "Ptr", hwndActive
         , "Ptr", 0, "UInt")
     NumPut "UInt", guiThreadInfo.Size, guiThreadInfo
-    if !DllCall("GetGUIThreadInfo", "UInt", threadId, "Ptr", guiThreadInfo, "Int")
+    if !DllCall("GetGUIThreadInfo", "UInt", threadId, "Ptr", guiThreadInfo, "Int") {
+        if MonitorRunning {
+            cachedCycleId := MonitorCycleId
+            cachedHwnd := hwndActive
+            cachedResult := false
+        }
         return false
-    return {
+    }
+    rectOffset := 8 + 6 * A_PtrSize
+    result := {
         buffer: guiThreadInfo,
         focusHwnd: NumGet(guiThreadInfo, 8 + A_PtrSize, "Ptr"),
         caretHwnd: NumGet(guiThreadInfo, 8 + 5 * A_PtrSize, "Ptr"),
-        rectOffset: 8 + 6 * A_PtrSize
+        rectOffset: rectOffset,
+        rectLeft: NumGet(guiThreadInfo, rectOffset, "Int"),
+        rectTop: NumGet(guiThreadInfo, rectOffset + 4, "Int"),
+        rectRight: NumGet(guiThreadInfo, rectOffset + 8, "Int"),
+        rectBottom: NumGet(guiThreadInfo, rectOffset + 12, "Int")
     }
+    if MonitorRunning {
+        cachedCycleId := MonitorCycleId
+        cachedHwnd := hwndActive
+        cachedResult := result
+    }
+    return result
 }
 
 TryGetMsaaCaretAnchor(context) {
@@ -1797,12 +1816,9 @@ TryGetGuiThreadCaretAnchor(context) {
     if !threadInfo || !threadInfo.caretHwnd
         return CreateAnchorResult(, , , "GUIThreadCaret", AnchorConfidence.Invalid
             , true, "CaretWindowUnavailable", , context.hwnd)
-    offset := threadInfo.rectOffset
-    threadInfoBuffer := threadInfo.buffer
-    left := NumGet(threadInfoBuffer, offset, "Int")
-    top := NumGet(threadInfoBuffer, offset + 4, "Int")
-    right := NumGet(threadInfoBuffer, offset + 8, "Int")
-    bottom := NumGet(threadInfoBuffer, offset + 12, "Int")
+    left := threadInfo.rectLeft
+    top := threadInfo.rectTop
+    right := threadInfo.rectRight
     point := Buffer(8, 0)
     NumPut "Int", left, "Int", top, point
     if !DllCall("ClientToScreen", "Ptr", threadInfo.caretHwnd, "Ptr", point, "Int")
@@ -1944,6 +1960,7 @@ GetFocusedElementCached() {
 ResolveAnchor(context) {
     global AnchorConfidence, CaretPositionIsFallback
         , AnchorProbePending, LastAnchorProbeTick, ViewportState
+        , PostInputAnchorProbeDue
     if !context.hwnd
         return CreateAnchorResult(, , , "None", AnchorConfidence.Invalid
             , true, "ActiveWindowUnavailable")
@@ -1958,6 +1975,7 @@ ResolveAnchor(context) {
 
     if CaretGetPos(&caretX, &caretY) {
         AnchorProbePending := false
+        PostInputAnchorProbeDue := false
         CaretPositionIsFallback := false
         return CreateAnchorResult(true, caretX, caretY, "NativeCaret"
             , AnchorConfidence.Exact, false, , , context.hwnd)
@@ -1966,12 +1984,14 @@ ResolveAnchor(context) {
     guiThreadAnchor := TryGetGuiThreadCaretAnchor(context)
     if guiThreadAnchor.found {
         AnchorProbePending := false
+        PostInputAnchorProbeDue := false
         return guiThreadAnchor
     }
 
     if !ShouldRunHeavyAnchorProbe(context)
         return ResolveDeferredAnchor(context, "AnchorProbeDeferred")
 
+    PostInputAnchorProbeDue := false
     LastAnchorProbeTick := A_TickCount
     msaaAnchor := TryResolveMsaaAnchor(context)
     if msaaAnchor.found {
@@ -2131,11 +2151,12 @@ ShouldRunHeavyAnchorProbe(context) {
     global AnchorProbePending, AnchorProbeNotBeforeTick, LastAnchorActivityTick
         , LastAnchorProbeTick, AnchorProbeQuietMs
         , ChromiumAnchorProbeMinIntervalMs, DefaultAnchorProbeMinIntervalMs
+        , PostInputAnchorProbeDue
     if !AnchorProbePending
         return false
     if A_TickCount < AnchorProbeNotBeforeTick
         return false
-    if LastAnchorActivityTick
+    if !PostInputAnchorProbeDue && LastAnchorActivityTick
         && A_TickCount - LastAnchorActivityTick < AnchorProbeQuietMs
         return false
     minInterval := context.isChromium
