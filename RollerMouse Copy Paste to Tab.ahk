@@ -7,6 +7,32 @@ SendMode "Input"
 ; 同じVID/PIDのRollerMouseをすべて対象にする設定。
 global gTargetDevicePatterns := ["VID_0B33&PID_3022","VID_0B33&PID_2000"]
 
+; Ctrl+PgUp / Ctrl+PgDn を使うブラウザ。
+; 必要に応じて exe 名を追加・削除する。
+global gBrowserExecutables := Map(
+    "chrome.exe", true,
+    "brave.exe", true,
+    "msedge.exe", true,
+    "firefox.exe", true,
+    "vivaldi.exe", true,
+    "opera.exe", true,
+    "floorp.exe", true,
+    "librewolf.exe", true,
+    "waterfox.exe", true,
+    "zen.exe", true
+)
+
+; Ctrl+PgUp / Ctrl+PgDn を使う表計算アプリ。
+; LibreOffice / OpenOffice は soffice.bin を全アプリで共有するため、
+; Calc だけはウィンドウタイトルも併用して判定する。
+global gSpreadsheetExecutables := Map(
+    "excel.exe", true,          ; Microsoft Excel
+    "et.exe", true,             ; WPS Spreadsheets
+    "desktopeditors.exe", true, ; ONLYOFFICE Desktop Editors
+    "planmaker.exe", true,      ; SoftMaker / FreeOffice PlanMaker
+    "scalc.exe", true            ; LibreOffice Calc launcher
+)
+
 global gDevices := Map()
 ; 対象/非対象の判定結果をデバイスハンドル単位でキャッシュし、高頻度なマウス移動イベントでの再判定を避ける。
 global gDeviceIsTarget := Map()
@@ -17,12 +43,17 @@ global gLastTargetKeyDownTick := 0
 global gPending := []
 global gRawInputDetectionWindow := 40
 global gKeyChordWindow := 120
+global gTargetCtrlReleaseTimeout := 750
 global gLeftButtonDown := false
 global gRightButtonDown := false
 global gLeftButtonDownTick := 0
 global gRightButtonDownTick := 0
 global gMouseChordWindow := 150
 global gMouseChordTriggered := false
+global gDiagnosticEnabled := false
+global gDiagnosticLogPath := A_ScriptDir "\logs\RollerMouseTabDiag_" FormatTime(, "yyyyMMdd_HHmmss") ".log"
+global gDiagnosticBuffer := []
+global gLastTabSendTick := 0
 
 ; Raw Input用の受信バッファは起動時に一度だけ確保し、イベント毎の再確保を避ける。
 ; RAWINPUTHEADER(8 + 2*ポインタ長) + RAWMOUSE/RAWKEYBOARD本体で十分な余裕を持たせる。
@@ -37,6 +68,12 @@ if (!RegisterRawInput(0x06, rollerMouseGui.Hwnd)  ; Generic Desktop / Keyboard
     || !RegisterRawInput(0x02, rollerMouseGui.Hwnd)) {  ; Generic Desktop / Mouse
     MsgBox "Raw Inputの登録に失敗しました。", "RollerMouse Remap", "Iconx"
     ExitApp
+}
+
+if (gDiagnosticEnabled) {
+    DirCreate A_ScriptDir "\logs"
+    OnExit FlushDiagnosticLog
+    LogDiagnostic("startup ahk=" A_AhkVersion " pid=" ProcessExist())
 }
 
 ; タイマーは常時回さず、キューに投入された時だけ起動する（QueueChord内で開始）。
@@ -82,13 +119,22 @@ QueueChord(name) {
 
     Critical()
     fromTarget := IsTargetCtrlActive()
-    gPending.Push({name: name, tick: A_TickCount, fromTarget: fromTarget})
+    gPending.Push({
+        name: name,
+        tick: A_TickCount,
+        fromTarget: fromTarget,
+        releaseWaitLogged: false
+    })
+    LogDiagnostic("queue name=" name
+        " hotkey=" A_ThisHotkey
+        " fromTarget=" (fromTarget ? 1 : 0)
+        " pending=" gPending.Length)
     SetTimer ProcessPendingChords, 10
 }
 
 
 ProcessPendingChords() {
-    global gPending, gKeyChordWindow
+    global gPending, gKeyChordWindow, gTargetCtrlDown, gTargetCtrlReleaseTimeout
 
     Critical()
 
@@ -98,21 +144,54 @@ ProcessPendingChords() {
         ; WM_INPUTがホットキー処理より後に届く場合を待つ。
         fromTarget := IsChordFromTarget(pending)
         waitTime := fromTarget ? gKeyChordWindow : 30
-        if ((A_TickCount - pending.tick) < waitTime)
+        age := A_TickCount - pending.tick
+        if (age < waitTime)
             return
+
+        ; RollerMouseが元のCtrlを物理的に保持している間に合成Ctrlを送ると、
+        ; 物理状態と論理状態が競合する。通常はCtrl upを待ち、Raw Inputの
+        ; up取りこぼし時だけタイムアウト後に処理を続ける。
+        ctrlStillDown := gTargetCtrlDown || GetKeyState("Ctrl", "P")
+        if (fromTarget && ctrlStillDown && age < gTargetCtrlReleaseTimeout) {
+            if (!pending.releaseWaitLogged) {
+                pending.releaseWaitLogged := true
+                LogDiagnostic("wait_ctrl_release name=" pending.name
+                    " age=" age
+                    " pending=" gPending.Length)
+            }
+            return
+        }
+
+        if (pending.releaseWaitLogged) {
+            LogDiagnostic((ctrlStillDown ? "ctrl_release_timeout" : "ctrl_released")
+                " name=" pending.name
+                " age=" age
+                " pending=" gPending.Length)
+        }
 
         if (fromTarget) {
             counterpartIndex := FindTargetKeyCounterpart(pending)
             if (counterpartIndex) {
+                counterpart := gPending[counterpartIndex]
+                LogDiagnostic("consume_close first=" pending.name
+                    " second=" counterpart.name
+                    " age=" (A_TickCount - pending.tick)
+                    " pending=" gPending.Length)
                 gPending.RemoveAt(counterpartIndex)
                 gPending.RemoveAt(1)
                 SendCloseTabByKeys()
                 continue
             }
 
+            LogDiagnostic("dequeue_tab name=" pending.name
+                " age=" (A_TickCount - pending.tick)
+                " pending=" gPending.Length)
             gPending.RemoveAt(1)
             SendTabChord(pending.name)
         } else {
+            LogDiagnostic("dequeue_passthrough name=" pending.name
+                " age=" (A_TickCount - pending.tick)
+                " pending=" gPending.Length)
             gPending.RemoveAt(1)
 
             if (pending.name = "C")
@@ -152,6 +231,42 @@ IsChordFromTarget(entry) {
 }
 
 
+LogDiagnostic(event) {
+    global gDiagnosticEnabled, gDiagnosticBuffer, gTargetCtrlDown
+
+    if (!gDiagnosticEnabled)
+        return
+
+    ctrlLogical := GetKeyState("Ctrl") ? 1 : 0
+    ctrlPhysical := GetKeyState("Ctrl", "P") ? 1 : 0
+    leftPhysical := GetKeyState("LCtrl", "P") ? 1 : 0
+    rightPhysical := GetKeyState("RCtrl", "P") ? 1 : 0
+    gDiagnosticBuffer.Push(A_TickCount "`t" event
+        "`trawCtrl=" (gTargetCtrlDown ? 1 : 0)
+        " logicalCtrl=" ctrlLogical
+        " physicalCtrl=" ctrlPhysical
+        " physicalL=" leftPhysical
+        " physicalR=" rightPhysical)
+    SetTimer FlushDiagnosticLog, -250
+}
+
+
+FlushDiagnosticLog(*) {
+    global gDiagnosticEnabled, gDiagnosticBuffer, gDiagnosticLogPath
+
+    if (!gDiagnosticEnabled || gDiagnosticBuffer.Length = 0)
+        return
+
+    Critical()
+    output := ""
+    for line in gDiagnosticBuffer
+        output .= line "`n"
+    gDiagnosticBuffer := []
+
+    try FileAppend output, gDiagnosticLogPath, "UTF-8"
+}
+
+
 SendCloseTabByKeys() {
     SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{F4 down}{F4 up}{Ctrl up}"
 }
@@ -167,19 +282,127 @@ DismissContextMenu() {
 }
 
 
-SendTabChord(sourceKey) {
-    ; Blindモードで、物理Ctrlが押下中でも送信後の自動再押下を防ぐ。
-    ; Shiftはupを送らず物理状態を維持し、同時押し時はシート切替ショートカットになる。
+IsBrowserAppActive() {
+    global gBrowserExecutables
 
-    if (sourceKey = "C") {
-        ; SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Shift down}{Tab down}{Tab up}{Shift up}{Ctrl up}"
-        ; TrayTip, RollerMouse Remap, Copy -> Ctrl+Shift+Tab, 1, 1
-        SendInput "{Blind}{c up}{v up}{Ctrl up}{Ctrl down}{PgUp down}{PgUp up}{Ctrl up}"
-    } else {
-        ; SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Tab down}{Tab up}{Ctrl up}"
-        ; TrayTip, RollerMouse Remap, Paste -> Ctrl+Tab, 1, 1
-        SendInput "{Blind}{c up}{v up}{Ctrl up}{Ctrl down}{PgDn down}{PgDn up}{Ctrl up}"
+    try exe := StrLower(WinGetProcessName("A"))
+    catch
+        return false
+
+    return gBrowserExecutables.Has(exe)
+}
+
+
+IsSpreadsheetAppActive() {
+    global gSpreadsheetExecutables
+
+    try exe := StrLower(WinGetProcessName("A"))
+    catch
+        return false
+
+    if (gSpreadsheetExecutables.Has(exe))
+        return true
+
+    ; LibreOffice / Apache OpenOffice は Writer / Calc / Impress などで
+    ; soffice.bin / soffice.exe を共有するため、Calc のときだけ PgUp 系にする。
+    if (exe = "soffice.bin" || exe = "soffice.exe") {
+        try title := WinGetTitle("A")
+        catch
+            return false
+
+        return RegExMatch(title, "i)(LibreOffice|OpenOffice).*Calc|Calc.*(LibreOffice|OpenOffice)") != 0
     }
+
+    return false
+}
+
+
+UsePageNavigation() {
+    return IsBrowserAppActive() || IsSpreadsheetAppActive()
+}
+
+
+SendExplorerTabChord(sourceKey) {
+    ; Explorerは瞬時のSendInputを取りこぼすことがあるため、
+    ; 物理キーに近い押下時間を持つSendEventで送る。
+    SetKeyDelay 20, 30
+
+    if (sourceKey = "C")
+        SendEvent "^+{Tab}"
+    else
+        SendEvent "^{Tab}"
+}
+
+
+SendTabChord(sourceKey) {
+    global gLastTabSendTick
+
+    ; Shift はモード切替に使わない。物理状態をそのまま維持する。
+    ; そのため Shift が押されている場合は、送信先アプリ側で
+    ; Ctrl+Shift+PgUp/PgDn や Ctrl+Shift+Tab として解釈される。
+
+    try activeExe := StrLower(WinGetProcessName("A"))
+    catch
+        activeExe := "unknown"
+
+    isDownloads := 0
+    focusedControl := "unknown"
+    if (activeExe = "explorer.exe") {
+        try isDownloads := InStr(WinGetTitle("A"), "ダウンロード") ? 1 : 0
+        try focusedControl := ControlGetClassNN(ControlGetFocus("A"))
+    }
+
+    usePage := UsePageNavigation()
+    sendTick := A_TickCount
+    sendGap := gLastTabSendTick ? sendTick - gLastTabSendTick : -1
+    gLastTabSendTick := sendTick
+    LogDiagnostic("send_begin name=" sourceKey
+        " exe=" activeExe
+        " page=" (usePage ? 1 : 0)
+        " gap=" sendGap
+        " downloads=" isDownloads
+        " focus=" focusedControl)
+
+    if (usePage) {
+        ; ブラウザ / 表計算アプリ:
+        ; Copy  -> Ctrl+PgUp
+        ; Paste -> Ctrl+PgDn
+        ; Shift は up を送らず、そのまま透過させる。
+        if (sourceKey = "C") {
+            SendInput "{Blind}{c up}{v up}{Ctrl up}{Ctrl down}{PgUp down}{PgUp up}{Ctrl up}"
+        } else {
+            SendInput "{Blind}{c up}{v up}{Ctrl up}{Ctrl down}{PgDn down}{PgDn up}{Ctrl up}"
+        }
+        LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=1")
+        SetTimer LogSettledCtrlState, -100
+        return
+    }
+
+    if (activeExe = "explorer.exe") {
+        SendExplorerTabChord(sourceKey)
+        LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=0 mode=event")
+        SetTimer LogSettledCtrlState, -100
+        return
+    }
+
+    ; その他の通常アプリ:
+    ; Copy  -> Ctrl+Shift+Tab（前のタブ）
+    ; Paste -> Ctrl+Tab       （次のタブ）
+    ;
+    ; 物理 Shift がすでに押されている場合は触らない。
+    ; Copy 側で Shift が押されていない場合だけ、一時的に Shift を付与する。
+    if (sourceKey = "C") {
+        SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Shift down}{Tab down}{Tab up}{Shift up}{Ctrl up}"
+    } else {
+        SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Tab down}{Tab up}{Ctrl up}"
+    }
+    LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=0 mode=input")
+    SetTimer LogSettledCtrlState, -100
+}
+
+
+LogSettledCtrlState() {
+    LogDiagnostic("send_settled")
 }
 
 
@@ -267,6 +490,9 @@ OnRawInput(wParam, lParam, msg, hwnd) {
     if (vkey = 0x11 || vkey = 0xA2 || vkey = 0xA3) {
         gTargetCtrlDown := isDown
         gLastTargetKeyDownTick := A_TickCount
+        LogDiagnostic("raw_ctrl vkey=" Format("0x{:02X}", vkey)
+            " down=" (isDown ? 1 : 0)
+            " flags=" Format("0x{:02X}", flags))
     }
 }
 

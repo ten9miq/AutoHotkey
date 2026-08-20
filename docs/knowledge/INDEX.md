@@ -5,3 +5,4 @@
 
 | Status | Type | Summary | Tags | Paths | Freshness | Last verified | Document |
 |---|---|---|---|---|---|---|---|
+| current | investigation | Explorerだけキー間隔付きSendEventへ切り替えると、RollerMouseによるDownloadsを含む連続タブ移動が安定した | file-explorer, tabs, rollermouse, sendinput, sendevent | RollerMouse Copy Paste to Tab.ahk | version-sensitive | 2026-08-21 | [rollermouse-explorer-tab-repeat-stalls.md](investigations/rollermouse-explorer-tab-repeat-stalls.md) |
