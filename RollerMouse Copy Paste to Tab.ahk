@@ -50,8 +50,9 @@ global gLeftButtonDownTick := 0
 global gRightButtonDownTick := 0
 global gMouseChordWindow := 150
 global gMouseChordTriggered := false
+; 再調査時だけtrueにする。本番時は診断用の状態取得・タイマー・ファイルI/Oを実行しない。
 global gDiagnosticEnabled := false
-global gDiagnosticLogPath := A_ScriptDir "\logs\RollerMouseTabDiag_" FormatTime(, "yyyyMMdd_HHmmss") ".log"
+global gDiagnosticLogPath := ""
 global gDiagnosticBuffer := []
 global gLastTabSendTick := 0
 
@@ -71,6 +72,7 @@ if (!RegisterRawInput(0x06, rollerMouseGui.Hwnd)  ; Generic Desktop / Keyboard
 }
 
 if (gDiagnosticEnabled) {
+    gDiagnosticLogPath := A_ScriptDir "\logs\RollerMouseTabDiag_" FormatTime(, "yyyyMMdd_HHmmss") ".log"
     DirCreate A_ScriptDir "\logs"
     OnExit FlushDiagnosticLog
     LogDiagnostic("startup ahk=" A_AhkVersion " pid=" ProcessExist())
@@ -115,7 +117,7 @@ RegisterRawInput(usage, hwnd) {
 
 
 QueueChord(name) {
-    global gPending
+    global gPending, gDiagnosticEnabled
 
     Critical()
     fromTarget := IsTargetCtrlActive()
@@ -125,16 +127,19 @@ QueueChord(name) {
         fromTarget: fromTarget,
         releaseWaitLogged: false
     })
-    LogDiagnostic("queue name=" name
-        " hotkey=" A_ThisHotkey
-        " fromTarget=" (fromTarget ? 1 : 0)
-        " pending=" gPending.Length)
+    if (gDiagnosticEnabled) {
+        LogDiagnostic("queue name=" name
+            " hotkey=" A_ThisHotkey
+            " fromTarget=" (fromTarget ? 1 : 0)
+            " pending=" gPending.Length)
+    }
     SetTimer ProcessPendingChords, 10
 }
 
 
 ProcessPendingChords() {
     global gPending, gKeyChordWindow, gTargetCtrlDown, gTargetCtrlReleaseTimeout
+    global gDiagnosticEnabled
 
     Critical()
 
@@ -153,7 +158,7 @@ ProcessPendingChords() {
         ; up取りこぼし時だけタイムアウト後に処理を続ける。
         ctrlStillDown := gTargetCtrlDown || GetKeyState("Ctrl", "P")
         if (fromTarget && ctrlStillDown && age < gTargetCtrlReleaseTimeout) {
-            if (!pending.releaseWaitLogged) {
+            if (gDiagnosticEnabled && !pending.releaseWaitLogged) {
                 pending.releaseWaitLogged := true
                 LogDiagnostic("wait_ctrl_release name=" pending.name
                     " age=" age
@@ -162,7 +167,7 @@ ProcessPendingChords() {
             return
         }
 
-        if (pending.releaseWaitLogged) {
+        if (gDiagnosticEnabled && pending.releaseWaitLogged) {
             LogDiagnostic((ctrlStillDown ? "ctrl_release_timeout" : "ctrl_released")
                 " name=" pending.name
                 " age=" age
@@ -172,26 +177,32 @@ ProcessPendingChords() {
         if (fromTarget) {
             counterpartIndex := FindTargetKeyCounterpart(pending)
             if (counterpartIndex) {
-                counterpart := gPending[counterpartIndex]
-                LogDiagnostic("consume_close first=" pending.name
-                    " second=" counterpart.name
-                    " age=" (A_TickCount - pending.tick)
-                    " pending=" gPending.Length)
+                if (gDiagnosticEnabled) {
+                    counterpart := gPending[counterpartIndex]
+                    LogDiagnostic("consume_close first=" pending.name
+                        " second=" counterpart.name
+                        " age=" (A_TickCount - pending.tick)
+                        " pending=" gPending.Length)
+                }
                 gPending.RemoveAt(counterpartIndex)
                 gPending.RemoveAt(1)
                 SendCloseTabByKeys()
                 continue
             }
 
-            LogDiagnostic("dequeue_tab name=" pending.name
-                " age=" (A_TickCount - pending.tick)
-                " pending=" gPending.Length)
+            if (gDiagnosticEnabled) {
+                LogDiagnostic("dequeue_tab name=" pending.name
+                    " age=" (A_TickCount - pending.tick)
+                    " pending=" gPending.Length)
+            }
             gPending.RemoveAt(1)
             SendTabChord(pending.name)
         } else {
-            LogDiagnostic("dequeue_passthrough name=" pending.name
-                " age=" (A_TickCount - pending.tick)
-                " pending=" gPending.Length)
+            if (gDiagnosticEnabled) {
+                LogDiagnostic("dequeue_passthrough name=" pending.name
+                    " age=" (A_TickCount - pending.tick)
+                    " pending=" gPending.Length)
+            }
             gPending.RemoveAt(1)
 
             if (pending.name = "C")
@@ -282,23 +293,15 @@ DismissContextMenu() {
 }
 
 
-IsBrowserAppActive() {
+IsBrowserAppActive(exe) {
     global gBrowserExecutables
-
-    try exe := StrLower(WinGetProcessName("A"))
-    catch
-        return false
 
     return gBrowserExecutables.Has(exe)
 }
 
 
-IsSpreadsheetAppActive() {
+IsSpreadsheetAppActive(exe) {
     global gSpreadsheetExecutables
-
-    try exe := StrLower(WinGetProcessName("A"))
-    catch
-        return false
 
     if (gSpreadsheetExecutables.Has(exe))
         return true
@@ -317,8 +320,8 @@ IsSpreadsheetAppActive() {
 }
 
 
-UsePageNavigation() {
-    return IsBrowserAppActive() || IsSpreadsheetAppActive()
+UsePageNavigation(exe) {
+    return IsBrowserAppActive(exe) || IsSpreadsheetAppActive(exe)
 }
 
 
@@ -335,7 +338,7 @@ SendExplorerTabChord(sourceKey) {
 
 
 SendTabChord(sourceKey) {
-    global gLastTabSendTick
+    global gDiagnosticEnabled, gLastTabSendTick
 
     ; Shift はモード切替に使わない。物理状態をそのまま維持する。
     ; そのため Shift が押されている場合は、送信先アプリ側で
@@ -345,23 +348,26 @@ SendTabChord(sourceKey) {
     catch
         activeExe := "unknown"
 
-    isDownloads := 0
-    focusedControl := "unknown"
-    if (activeExe = "explorer.exe") {
-        try isDownloads := InStr(WinGetTitle("A"), "ダウンロード") ? 1 : 0
-        try focusedControl := ControlGetClassNN(ControlGetFocus("A"))
-    }
+    usePage := UsePageNavigation(activeExe)
 
-    usePage := UsePageNavigation()
-    sendTick := A_TickCount
-    sendGap := gLastTabSendTick ? sendTick - gLastTabSendTick : -1
-    gLastTabSendTick := sendTick
-    LogDiagnostic("send_begin name=" sourceKey
-        " exe=" activeExe
-        " page=" (usePage ? 1 : 0)
-        " gap=" sendGap
-        " downloads=" isDownloads
-        " focus=" focusedControl)
+    if (gDiagnosticEnabled) {
+        isDownloads := 0
+        focusedControl := "unknown"
+        if (activeExe = "explorer.exe") {
+            try isDownloads := InStr(WinGetTitle("A"), "ダウンロード") ? 1 : 0
+            try focusedControl := ControlGetClassNN(ControlGetFocus("A"))
+        }
+
+        sendTick := A_TickCount
+        sendGap := gLastTabSendTick ? sendTick - gLastTabSendTick : -1
+        gLastTabSendTick := sendTick
+        LogDiagnostic("send_begin name=" sourceKey
+            " exe=" activeExe
+            " page=" (usePage ? 1 : 0)
+            " gap=" sendGap
+            " downloads=" isDownloads
+            " focus=" focusedControl)
+    }
 
     if (usePage) {
         ; ブラウザ / 表計算アプリ:
@@ -373,15 +379,19 @@ SendTabChord(sourceKey) {
         } else {
             SendInput "{Blind}{c up}{v up}{Ctrl up}{Ctrl down}{PgDn down}{PgDn up}{Ctrl up}"
         }
-        LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=1")
-        SetTimer LogSettledCtrlState, -100
+        if (gDiagnosticEnabled) {
+            LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=1")
+            SetTimer LogSettledCtrlState, -100
+        }
         return
     }
 
     if (activeExe = "explorer.exe") {
         SendExplorerTabChord(sourceKey)
-        LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=0 mode=event")
-        SetTimer LogSettledCtrlState, -100
+        if (gDiagnosticEnabled) {
+            LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=0 mode=event")
+            SetTimer LogSettledCtrlState, -100
+        }
         return
     }
 
@@ -396,8 +406,10 @@ SendTabChord(sourceKey) {
     } else {
         SendInput "{Blind}{c up}{v up}{Ctrl up}{Shift up}{Ctrl down}{Tab down}{Tab up}{Ctrl up}"
     }
-    LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=0 mode=input")
-    SetTimer LogSettledCtrlState, -100
+    if (gDiagnosticEnabled) {
+        LogDiagnostic("send_end name=" sourceKey " exe=" activeExe " page=0 mode=input")
+        SetTimer LogSettledCtrlState, -100
+    }
 }
 
 
@@ -411,6 +423,7 @@ OnRawInput(wParam, lParam, msg, hwnd) {
     global gLeftButtonDown, gRightButtonDown, gMouseChordTriggered
     global gLeftButtonDownTick, gRightButtonDownTick, gMouseChordWindow
     global gRawInputBuffer
+    global gDiagnosticEnabled
 
     Critical()
 
@@ -490,9 +503,11 @@ OnRawInput(wParam, lParam, msg, hwnd) {
     if (vkey = 0x11 || vkey = 0xA2 || vkey = 0xA3) {
         gTargetCtrlDown := isDown
         gLastTargetKeyDownTick := A_TickCount
-        LogDiagnostic("raw_ctrl vkey=" Format("0x{:02X}", vkey)
-            " down=" (isDown ? 1 : 0)
-            " flags=" Format("0x{:02X}", flags))
+        if (gDiagnosticEnabled) {
+            LogDiagnostic("raw_ctrl vkey=" Format("0x{:02X}", vkey)
+                " down=" (isDown ? 1 : 0)
+                " flags=" Format("0x{:02X}", flags))
+        }
     }
 }
 
