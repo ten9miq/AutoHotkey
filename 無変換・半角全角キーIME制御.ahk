@@ -15,7 +15,7 @@ global LastKeyDownVk := 0
 global RdpActiveCacheValue := false
 global RdpActiveCacheTick := 0
 
-physicalKeyMonitor := InputHook("V I1")
+physicalKeyMonitor := InputHook("V I1 L0")
 physicalKeyMonitor.KeyOpt("{All}", "N")
 physicalKeyMonitor.OnKeyDown := OnPhysicalKeyDown
 physicalKeyMonitor.OnKeyUp := OnPhysicalKeyUp
