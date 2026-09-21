@@ -21,6 +21,7 @@ global gEdit := monitorEdit.Hwnd
 global gGui := monitorGui.Hwnd
 global gStatus := statusText
 monitorGui.OnEvent("Close", CloseMonitor)
+monitorGui.OnEvent("Size", OnGuiSize)
 startButton.OnEvent("Click", StartMonitoring)
 stopButton.OnEvent("Click", StopMonitoring)
 reloadButton.OnEvent("Click", ReloadSettings)
@@ -85,6 +86,18 @@ SendTestClick(*) {
 UpdateStatus(state) {
     global gStatus, gLastInput
     gStatus.Text := "状態: " state " / 最後の入力: " gLastInput
+}
+
+OnGuiSize(gui, minMax, width, height) {
+    global buttonRow, statusText, monitorEdit
+    if (minMax = -1 || width <= 0 || height <= 0)
+        return
+
+    contentWidth := Max(width - 20, 100)
+    editHeight := Max(height - 110, 80)
+    buttonRow.Move(10, 10, contentWidth, 52)
+    statusText.Move(10, 72, contentWidth, 20)
+    monitorEdit.Move(10, 100, contentWidth, editHeight)
 }
 
 
@@ -444,6 +457,25 @@ HexDump(buf, offset, length)
 }
 
 
+GetFirstVisibleLine(hwnd)
+{
+    return DllCall("user32\SendMessageW", "Ptr", hwnd, "UInt", 0x00CE, "Ptr", 0, "Ptr", 0)
+}
+
+IsEditAtBottom(hwnd)
+{
+    si := Buffer(28, 0)
+    NumPut("UInt", 28, si, 0)
+    NumPut("UInt", 0x17, si, 4) ; SIF_ALL
+    if (!DllCall("user32\GetScrollInfo", "Ptr", hwnd, "Int", 1, "Ptr", si, "Int"))
+        return true
+
+    nMax := NumGet(si, 12, "Int")
+    nPage := NumGet(si, 16, "UInt")
+    nPos := NumGet(si, 20, "Int")
+    return (nPos + nPage >= nMax - 1)
+}
+
 Log(text)
 {
     global gEdit
@@ -464,6 +496,19 @@ Log(text)
     if (selectionStart != selectionEnd)
         return
 
+    ; 追記前の表示位置を保存する。末尾表示中だけ自動スクロールする。
+    atBottom := IsEditAtBottom(gEdit)
+    firstVisibleLine := GetFirstVisibleLine(gEdit)
+
+    ; 上へスクロール中だけ、一時的なスクロールを画面へ見せない。
+    if (!atBottom) {
+        DllCall("user32\SendMessageW"
+            , "Ptr", gEdit
+            , "UInt", 0x000B ; WM_SETREDRAW
+            , "Ptr", 0
+            , "Ptr", 0)
+    }
+
     ; Edit末尾へキャレットを移動して追記
     textLength := DllCall("user32\SendMessageW"
         , "Ptr", gEdit
@@ -483,12 +528,24 @@ Log(text)
         , "Ptr", 0
         , "WStr", line)
 
-    DllCall("user32\SendMessageW"
-        , "Ptr", gEdit
-        , "UInt", 0x00B7 ; EM_SCROLLCARET
-        , "Ptr", 0
-        , "Ptr", 0)
+    if (atBottom) {
+        DllCall("user32\SendMessageW"
+            , "Ptr", gEdit
+            , "UInt", 0x00B7 ; EM_SCROLLCARET
+            , "Ptr", 0
+            , "Ptr", 0)
+    } else {
+        currentFirstLine := GetFirstVisibleLine(gEdit)
+        DllCall("user32\SendMessageW"
+            , "Ptr", gEdit
+            , "UInt", 0x00B6 ; EM_LINESCROLL
+            , "Ptr", 0
+            , "Ptr", firstVisibleLine - currentFirstLine)
+        DllCall("user32\SendMessageW"
+            , "Ptr", gEdit
+            , "UInt", 0x000B ; WM_SETREDRAW
+            , "Ptr", 1
+            , "Ptr", 0)
+        DllCall("user32\InvalidateRect", "Ptr", gEdit, "Ptr", 0, "Int", true)
+    }
 }
-
-
-
