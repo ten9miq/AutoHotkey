@@ -1,4 +1,5 @@
 logs/
+スタートアップ未使用/logs/
 AutoHotkey_*.zip
 temp/code-scan-history-*.csv
 v1/WindowSpy.ahk.lnk

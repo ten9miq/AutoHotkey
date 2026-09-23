@@ -5,6 +5,11 @@ global gDevices := Map()
 global gRegisteredPairs := Map()
 global gMonitoring := false
 global gLastInput := "なし"
+global gMouseLogging := false
+global gMouseMotionLogging := false
+global gMotionLogPath := ""
+global gMotionBuffer := []
+global gMotionDropped := 0
 
 monitorGui := Gui("+Resize", "RawInputMonitor")
 monitorGui.SetFont("s9", "Consolas")
@@ -14,12 +19,16 @@ stopButton := monitorGui.AddButton("x+8 yp w105", "監視停止")
 reloadButton := monitorGui.AddButton("x+8 yp w125", "設定再読み込み")
 clearButton := monitorGui.AddButton("x+8 yp w105", "ログ消去")
 clickButton := monitorGui.AddButton("x+8 yp w125", "テストクリック")
+mouseLogButton := monitorGui.AddButton("x+8 yp w125", "マウス記録: OFF")
+motionLogButton := monitorGui.AddButton("x+8 yp w145", "マウス移動記録: OFF")
 closeButton := monitorGui.AddButton("x+8 yp w105", "閉じる")
-statusText := monitorGui.AddText("xm y+10 w1100", "状態: 停止中 / 最後の入力: なし")
+statusText := monitorGui.AddText("xm y+10 w1100", "状態: 停止中 / マウス記録: OFF / 移動記録: OFF / 最後の入力: なし")
 monitorEdit := monitorGui.AddEdit("xm y+8 w1100 h590 ReadOnly -Wrap")
 global gEdit := monitorEdit.Hwnd
 global gGui := monitorGui.Hwnd
 global gStatus := statusText
+global gMouseLogButton := mouseLogButton
+global gMotionLogButton := motionLogButton
 monitorGui.OnEvent("Close", CloseMonitor)
 monitorGui.OnEvent("Size", OnGuiSize)
 startButton.OnEvent("Click", StartMonitoring)
@@ -27,6 +36,8 @@ stopButton.OnEvent("Click", StopMonitoring)
 reloadButton.OnEvent("Click", ReloadSettings)
 clearButton.OnEvent("Click", ClearLog)
 clickButton.OnEvent("Click", SendTestClick)
+mouseLogButton.OnEvent("Click", ToggleMouseLogging)
+motionLogButton.OnEvent("Click", ToggleMouseMotionLogging)
 closeButton.OnEvent("Click", CloseMonitor)
 monitorGui.Show()
 
@@ -40,6 +51,7 @@ Log("Raw Input監視の準備が完了しました。")
 Log("")
 
 CloseMonitor(*) {
+    FlushMotionLog()
     ExitApp
 }
 
@@ -83,9 +95,38 @@ SendTestClick(*) {
     Click("Left")
 }
 
+ToggleMouseLogging(*) {
+    global gMouseLogging, gMouseLogButton, gMonitoring
+    gMouseLogging := !gMouseLogging
+    gMouseLogButton.Text := "マウス記録: " (gMouseLogging ? "ON" : "OFF")
+    UpdateStatus(gMonitoring ? "監視中" : "停止中")
+    Log("=== MOUSE LOGGING " (gMouseLogging ? "ON" : "OFF") " ===")
+}
+
+ToggleMouseMotionLogging(*) {
+    global gMouseMotionLogging, gMotionLogButton, gMotionLogPath
+    gMouseMotionLogging := !gMouseMotionLogging
+    gMotionLogButton.Text := "マウス移動記録: " (gMouseMotionLogging ? "ON" : "OFF")
+    if (gMouseMotionLogging) {
+        basePath := A_ScriptDir "\logs\RawInputMonitor_mouse_motion_" FormatTime(A_Now, "yyyyMMdd_HHmmss") "_" A_TickCount
+        gMotionLogPath := basePath ".csv"
+        suffix := 1
+        while FileExist(gMotionLogPath) {
+            gMotionLogPath := basePath "_" suffix ".csv"
+            suffix += 1
+        }
+        EnsureMotionLogFile()
+        SetTimer(FlushMotionLog, 100)
+    } else {
+        SetTimer(FlushMotionLog, 0)
+        FlushMotionLog()
+    }
+    Log("=== MOUSE MOTION LOGGING " (gMouseMotionLogging ? "ON" : "OFF") " === " gMotionLogPath)
+}
+
 UpdateStatus(state) {
-    global gStatus, gLastInput
-    gStatus.Text := "状態: " state " / 最後の入力: " gLastInput
+    global gStatus, gLastInput, gMouseLogging, gMouseMotionLogging
+    gStatus.Text := "状態: " state " / マウス記録: " (gMouseLogging ? "ON" : "OFF") " / 移動記録: " (gMouseMotionLogging ? "ON" : "OFF") " / 最後の入力: " gLastInput
 }
 
 OnGuiSize(gui, minMax, width, height) {
@@ -378,6 +419,9 @@ OnRawInput(wParam, lParam, msg, hwnd)
     ; =========================
     if (type = 2)
     {
+        global gMouseLogging, gMouseMotionLogging
+        if (!gMouseLogging && !gMouseMotionLogging)
+            return
         sizeHid := NumGet(raw, dataOff + 0, "UInt")
         count := NumGet(raw, dataOff + 4, "UInt")
 
@@ -407,11 +451,18 @@ OnRawInput(wParam, lParam, msg, hwnd)
     ; =========================
     if (type = 0)
     {
+        usFlags := NumGet(raw, dataOff + 0, "UShort")
         buttonFlags := NumGet(raw, dataOff + 4, "UShort")
         buttonData := NumGet(raw, dataOff + 6, "UShort")
+        dx := NumGet(raw, dataOff + 12, "Int")
+        dy := NumGet(raw, dataOff + 16, "Int")
+
+        global gMouseLogging, gMouseMotionLogging
+        if (gMouseMotionLogging && (dx != 0 || dy != 0))
+            QueueMotionRecord(meta, hDevice, usFlags, dx, dy, buttonFlags, buttonData)
 
         ; マウス移動は大量に来るのでボタンだけ表示
-        if (buttonFlags = 0)
+        if (buttonFlags = 0 || !gMouseLogging)
             return
 
         Log("MOUSE "
@@ -456,6 +507,51 @@ HexDump(buf, offset, length)
     return result
 }
 
+
+EnsureMotionLogFile()
+{
+    global gMotionLogPath
+    DirCreate(A_ScriptDir "\logs")
+    if (!FileExist(gMotionLogPath))
+        FileAppend("tick,type,hDevice,VID,PID,devicePath,usFlags,dx,dy,buttonFlags,buttonData`r`n", gMotionLogPath, "UTF-8")
+}
+
+QueueMotionRecord(meta, hDevice, usFlags, dx, dy, buttonFlags, buttonData)
+{
+    global gMotionBuffer, gMotionDropped, gMouseMotionLogging
+    if (!gMouseMotionLogging)
+        return
+    if (gMotionBuffer.Length >= 5000) {
+        gMotionDropped += 1
+        return
+    }
+    csv := A_TickCount ",RAWINPUT," hDevice "," CsvField(meta.vid) "," CsvField(meta.pid) "," CsvField(meta.path) "," usFlags "," dx "," dy "," buttonFlags "," buttonData
+    gMotionBuffer.Push(csv "`r`n")
+}
+
+FlushMotionLog(*)
+{
+    global gMotionBuffer, gMotionLogPath, gMotionDropped
+    if (gMotionBuffer.Length = 0 && gMotionDropped = 0)
+        return
+    EnsureMotionLogFile()
+    text := ""
+    for _, line in gMotionBuffer
+        text .= line
+    if (gMotionDropped > 0) {
+        text .= A_TickCount ",DROPPED,,,,,,,,," gMotionDropped "`r`n"
+        gMotionDropped := 0
+    }
+    if (text != "")
+        FileAppend(text, gMotionLogPath, "UTF-8")
+    gMotionBuffer := []
+}
+
+CsvField(value)
+{
+    quote := Chr(34)
+    return quote StrReplace(value, quote, quote quote) quote
+}
 
 GetFirstVisibleLine(hwnd)
 {
