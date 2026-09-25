@@ -9,7 +9,7 @@ bravePath := '"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.ex
 ; RealForce Fn+F2: メール
 >+F2::Run "mailto:"
 ; RealForce Fn+F3: 電卓
->+F3::Run "calc.exe"
+>+F3::LaunchCalculator()
 ; 戻る
 $>!Left::Click "X1"
 ; 進む
@@ -63,4 +63,12 @@ IsTabPageNavigationTarget() {
     }
 
     return false
+}
+
+LaunchCalculator() {
+    Run "calc.exe"
+
+    ; 電卓のウィンドウが作られてから前面に出す。
+    if hwnd := WinWait("ahk_exe CalculatorApp.exe",, 5)
+        WinActivate(hwnd)
 }
