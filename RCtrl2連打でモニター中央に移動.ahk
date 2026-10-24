@@ -1,7 +1,9 @@
 #Requires AutoHotkey v2.0+
+#SingleInstance Force
 ; RCtrl2連打でカーソルをモニター中央に移動
-; Alt+F1で固定先モニターを現在カーソルがあるモニターに設定
-; Alt+F2で動的 / 固定モードを切り替え
+; Alt+F1で現在のモニター構成の固定先を、カーソルがあるモニターに設定
+; Alt+F2で現在のモニター構成の動的 / 固定モードを切り替え
+; 接続構成ごとに保存し、接続変更後は次の操作時に自動で切り替える
 
 InstallKeybdHook()
 
@@ -15,40 +17,26 @@ doubleTapThreshold := 400
 ;=== 設定ファイルのパス & 起動時に読み込み ===
 iniFile := A_ScriptDir "\RCtrl2連打でモニター中央に移動.ini"
 
-; 固定先モニター番号
-FixedMonitor := IniRead(iniFile, "Settings", "FixedMonitor", 0) + 0
-
-; 動的 / 固定モード
-; 0 = 動的モード
-; 1 = 固定モード
-FixedMode := IniRead(iniFile, "Settings", "FixedMode", "ERROR")
-
-; 旧設定との互換
-; 旧版では FixedMonitor=0 が動的、FixedMonitor>=1 が固定だったため、
-; FixedMode が存在しない場合だけ旧設定から初期モードを推定する
-if (FixedMode = "ERROR") {
-    FixedMode := (FixedMonitor = 0) ? 0 : 1
-} else {
-    FixedMode := FixedMode + 0
-}
+; 旧Settingsは最初の構成にだけ引き継ぐ。新しい構成は動的モードで開始する。
+; 起動時に接続変更中だった場合は、次の操作時に再取得する。
+try LoadMonitorProfile(GetMonitorConfiguration())
 
 
 ;=== Alt+F1 で固定先モニターを現在カーソルがあるモニターに設定 ===
 !F1::SetFixedMonitorFromCursor()
 
 SetFixedMonitorFromCursor() {
-    global FixedMode, FixedMonitor, iniFile
-
+    configuration := GetMonitorConfiguration()
+    profile := LoadMonitorProfile(configuration)
     MouseGetPos &mouseX, &mouseY
     currentMonitor := GetMonitorFromPoint(mouseX, mouseY)
 
-    if (currentMonitor >= 1) {
-        FixedMonitor := currentMonitor
-        FixedMode := 1
-        IniWrite FixedMonitor, iniFile, "Settings", "FixedMonitor"
-        IniWrite FixedMode, iniFile, "Settings", "FixedMode"
+    if (currentMonitor >= 1 && currentMonitor <= configuration.Ids.Length) {
+        profile.FixedMonitorId := configuration.Ids[currentMonitor]
+        profile.FixedMode := 1
+        SaveMonitorProfile(profile)
 
-        ToolTip "固定モード / 移動先モニター " FixedMonitor
+        ToolTip "この構成に保存：固定モード / 移動先モニター " currentMonitor
     } else {
         ToolTip "固定先モニターを判定できませんでした"
     }
@@ -61,37 +49,37 @@ SetFixedMonitorFromCursor() {
 !F2::ToggleFixedMode()
 
 ToggleFixedMode() {
-    global FixedMode, FixedMonitor, iniFile
+    configuration := GetMonitorConfiguration()
+    profile := LoadMonitorProfile(configuration)
+    destination := FindMonitorById(configuration, profile.FixedMonitorId)
 
-    monitorCount := MonitorGetCount()
-
-    if (FixedMode = 0) {
+    if (profile.FixedMode = 0) {
         ; 動的 → 固定
 
         ; 固定先が未設定または無効なら、現在カーソルがあるモニターを固定先にする
-        if (FixedMonitor < 1 || FixedMonitor > monitorCount) {
+        if (destination = 0) {
             MouseGetPos &mouseX, &mouseY
             currentMonitor := GetMonitorFromPoint(mouseX, mouseY)
 
-            if (currentMonitor >= 1) {
-                FixedMonitor := currentMonitor
-                IniWrite FixedMonitor, iniFile, "Settings", "FixedMonitor"
+            if (currentMonitor >= 1 && currentMonitor <= configuration.Ids.Length) {
+                destination := currentMonitor
+                profile.FixedMonitorId := configuration.Ids[currentMonitor]
             }
         }
 
-        FixedMode := 1
+        profile.FixedMode := 1
     } else {
         ; 固定 → 動的
-        FixedMode := 0
+        profile.FixedMode := 0
     }
 
-    IniWrite FixedMode, iniFile, "Settings", "FixedMode"
+    SaveMonitorProfile(profile)
 
-    modeText := FixedMode
-        ? "固定モード / 移動先モニター " FixedMonitor
+    modeText := profile.FixedMode
+        ? "固定モード / 移動先モニター " destination
         : "動的モード"
 
-    ToolTip "モード：" modeText
+    ToolTip "この構成に保存：" modeText
     SetTimer RemoveToolTip, -1000
 }
 
@@ -109,14 +97,14 @@ ToggleFixedMode() {
 
 ;=== カーソル移動処理 ===
 MoveCursorToTargetMonitor() {
-    global FixedMode, FixedMonitor
-
+    configuration := GetMonitorConfiguration()
+    profile := LoadMonitorProfile(configuration)
     MouseGetPos &mouseX, &mouseY
-    monitorCount := MonitorGetCount()
+    monitorCount := configuration.Ids.Length
 
-    if (FixedMode = 1) {
+    if (profile.FixedMode = 1) {
         ; 固定モード：Alt+F1で選んだ固定先へ移動
-        destination := FixedMonitor
+        destination := FindMonitorById(configuration, profile.FixedMonitorId)
 
         ; 固定先が無効なら、現在カーソルがあるモニターにフォールバック
         if (destination < 1 || destination > monitorCount) {
@@ -133,6 +121,101 @@ MoveCursorToTargetMonitor() {
 }
 
 
+;=== 接続中のモニターを番号ではなくデバイスIDで識別する ===
+GetMonitorConfiguration() {
+    ids := []
+    Loop MonitorGetCount() {
+        ids.Push(GetMonitorIdentity(MonitorGetName(A_Index)))
+    }
+    return {Ids: ids, Key: BuildMonitorConfigurationKey(ids)}
+}
+
+BuildMonitorConfigurationKey(ids) {
+    names := ""
+    for id in ids {
+        names .= id "`n"
+    }
+    ; 列挙順・画面番号・配置・解像度が変わっても同じ接続構成とする。
+    return StrReplace(RTrim(Sort(names), "`n"), "`n", "|")
+}
+
+GetMonitorIdentity(deviceName) {
+    identities := ""
+    deviceIndex := 0
+    Loop {
+        ; DISPLAY_DEVICEW: cb=0, StateFlags=324, DeviceID=328, sizeof=840
+        device := Buffer(840, 0)
+        NumPut "UInt", device.Size, device, 0
+        if !DllCall("user32\EnumDisplayDevicesW", "Str", deviceName,
+            "UInt", deviceIndex++, "Ptr", device, "UInt", 1, "Int") {
+            break
+        }
+        if (NumGet(device, 324, "UInt") & 1) {
+            id := StrGet(device.Ptr + 328, 128, "UTF-16")
+            if (id != "") {
+                identities .= StrUpper(id) "`n"
+            }
+        }
+    }
+    if (identities != "") {
+        return StrReplace(RTrim(Sort(identities), "`n"), "`n", ";")
+    }
+    ; リモート画面等でIDが得られない場合だけGDI名を使用する。
+    return "GDI:" StrUpper(deviceName)
+}
+
+FindMonitorById(configuration, id) {
+    for index, monitorId in configuration.Ids {
+        if (id = monitorId) {
+            return index
+        }
+    }
+    return 0
+}
+
+
+;=== 構成ごとの設定読み込み・保存 ===
+LoadMonitorProfile(configuration) {
+    global iniFile
+    sections := FileExist(iniFile) ? IniRead(iniFile) : ""
+    nextNumber := 1
+    hasProfiles := false
+    Loop Parse sections, "`n", "`r" {
+        if !RegExMatch(A_LoopField, "^MonitorProfile(\d+)$", &match) {
+            continue
+        }
+        hasProfiles := true
+        nextNumber := Max(nextNumber, match[1] + 1)
+        if (IniRead(iniFile, A_LoopField, "Configuration", "") = configuration.Key) {
+            return {Section: A_LoopField, Key: configuration.Key,
+                FixedMode: IniRead(iniFile, A_LoopField, "FixedMode", 0) = "1" ? 1 : 0,
+                FixedMonitorId: IniRead(iniFile, A_LoopField, "FixedMonitorId", "")}
+        }
+    }
+
+    profile := {Section: "MonitorProfile" nextNumber, Key: configuration.Key,
+        FixedMode: 0, FixedMonitorId: ""}
+    legacyMonitor := IniRead(iniFile, "Settings", "FixedMonitor", "")
+    if (!hasProfiles && RegExMatch(legacyMonitor, "^\d+$")) {
+        legacyMonitor += 0
+        profile.FixedMode := IniRead(iniFile, "Settings", "FixedMode",
+            legacyMonitor > 0 ? 1 : 0) = "1" ? 1 : 0
+        if (legacyMonitor >= 1 && legacyMonitor <= configuration.Ids.Length) {
+            profile.FixedMonitorId := configuration.Ids[legacyMonitor]
+        }
+        SaveMonitorProfile(profile)
+    }
+    return profile
+}
+
+SaveMonitorProfile(profile) {
+    global iniFile
+    IniWrite profile.FixedMode, iniFile, profile.Section, "FixedMode"
+    IniWrite profile.FixedMonitorId, iniFile, profile.Section, "FixedMonitorId"
+    IniWrite profile.Key, iniFile, profile.Section, "Configuration"
+}
+
+
 ;=== 指定座標が属するモニター番号を返す ===
 GetMonitorFromPoint(x, y) {
     monitorCount := MonitorGetCount()
@@ -140,8 +223,8 @@ GetMonitorFromPoint(x, y) {
     Loop monitorCount {
         MonitorGet A_Index, &monitorLeft, &monitorTop, &monitorRight, &monitorBottom
 
-        if (x >= monitorLeft && x <= monitorRight
-            && y >= monitorTop && y <= monitorBottom) {
+        if (x >= monitorLeft && x < monitorRight
+            && y >= monitorTop && y < monitorBottom) {
             return A_Index
         }
     }
