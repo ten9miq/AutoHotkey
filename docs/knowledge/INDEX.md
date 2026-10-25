@@ -5,5 +5,6 @@
 
 | Status | Type | Summary | Tags | Paths | Freshness | Last verified | Document |
 |---|---|---|---|---|---|---|---|
+| current | investigation | 日付GUIはAlwaysOnTopでもタスクバーの裏へ回るため、各タスクバーの検出とSetWindowPosによる順序更新が必要 | taskbar, overlay, z-order, multi-monitor, DPI | TaskbarDateOverlay.ahk | version-sensitive | 2026-10-26 | [taskbar-date-overlay-z-order.md](investigations/taskbar-date-overlay-z-order.md) |
 | current | decision | RCtrl移動先は接続中のモニターID集合ごとに保存し、列挙番号が変わってもIDから移動先を解決する | monitor, display, RCtrl, profile, ini | RCtrl2連打でモニター中央に移動.ahk | version-sensitive | 2026-10-24 | [monitor-profile-identity.md](decisions/monitor-profile-identity.md) |
 | current | investigation | Explorerだけキー間隔付きSendEventへ切り替えると、RollerMouseによるDownloadsを含む連続タブ移動が安定した | file-explorer, tabs, rollermouse, sendinput, sendevent | RollerMouse Copy Paste to Tab.ahk | version-sensitive | 2026-08-21 | [rollermouse-explorer-tab-repeat-stalls.md](investigations/rollermouse-explorer-tab-repeat-stalls.md) |
