@@ -4,15 +4,15 @@
 Persistent
 
 ; ===== 設定 =====
-DATE_FORMAT := "MM/dd (ddd)"
-TEXT_COLOR := "FFFFFF" ; 白文字（ダークモード向け）
-OUTLINE_COLOR := "000000"
-OUTLINE_PIXELS := 1   ; 文字の周囲に付ける黒い縁取り（物理ピクセル）
+DATE_FORMAT := "yy/MM/dd(ddd)"
+TEXT_COLOR := "000000" ; 黒文字
+OUTLINE_COLOR := "FFFFFF"
+OUTLINE_PIXELS := 0   ; 文字の周囲に付ける黒い縁取り（物理ピクセル）
 MAX_FONT_SIZE := 10    ; 拡大率100%時のポイント数。領域に合わせて縮小する。
 MIN_FONT_SIZE := 8     ; 読めないほど小さくしない。
 DATE_WIDTH := 120     ; 拡大率100%時の表示幅
 CLOCK_GAP := 4        ; 時計の左隣との間隔
-DATE_X_OFFSET := 34   ; 現在の左隣位置から右へずらす距離（拡大率100%時）
+DATE_X_OFFSET := 36   ; 現在の左隣位置から右へずらす距離（拡大率100%時）
 TRANSPARENT := "EEAA99"
 
 DateOverlays := Map()
@@ -35,6 +35,7 @@ UpdateDate() {
         try {
             WinGetPos(&tx, &ty, &tw, &th, taskbar)
             dpi := DllCall("GetDpiForWindow", "ptr", taskbar, "uint")
+            isMainTaskbar := WinGetClass(taskbar) = "Shell_TrayWnd"
         } catch TargetError {
             continue
         }
@@ -57,7 +58,7 @@ UpdateDate() {
 
         gap := Round(CLOCK_GAP * dpi / 96)
         overlayWidth := Min(Round(DATE_WIDTH * dpi / 96), Floor(clockRect.x - tx) - gap)
-        ; 時計の左隣で、タスクバーの下半分を使う。
+        ; 表示領域の高さはタスクバーの下半分に合わせる。
         overlayHeight := th - Floor(th / 2)
         if (overlayWidth < 1 || overlayHeight < 1
             || !FitDateText(overlay, date, overlayWidth, overlayHeight, dpi)) {
@@ -67,7 +68,8 @@ UpdateDate() {
 
         x := Round(clockRect.x) - gap - overlayWidth + Round(DATE_X_OFFSET * dpi / 96)
         x := Max(tx, Min(x, tx + tw - overlayWidth))
-        y := ty + Floor(th / 2)
+        y := isMainTaskbar ? ty + Floor(th / 2)
+            : ty + Floor((th - overlay.TextHeight) / 2) - (overlayHeight - overlay.TextHeight)
         overlay.Text.Move(0, 0, overlayWidth, overlayHeight)
         overlay.Window.Show("x" x " y" y " w" overlayWidth " h" overlayHeight " NoActivate")
         ; タスクバーも最前面。Showだけでは裏に残るので順序を戻す。
@@ -123,7 +125,7 @@ FitDateText(overlay, date, availableWidth, availableHeight, dpi) {
     pointSize := MAX_FONT_SIZE
     while (pointSize >= MIN_FONT_SIZE) {
         ; AHKのフォントはシステムDPIで換算されるため、対象DPIに補正する。
-        overlay.Text.SetFont("s" (pointSize * dpi / A_ScreenDPI) " bold q3")
+        overlay.Text.SetFont("s" (pointSize * dpi / A_ScreenDPI) " w550 q5")
         textSize := MeasureDateText(overlay.Text, date)
         textSize.w += OUTLINE_PIXELS * 2
         textSize.h += OUTLINE_PIXELS * 2
@@ -192,7 +194,7 @@ PaintDateText(control, hdc, rect) {
         areaWidth := NumGet(rect, 8, "int") - left
         areaHeight := NumGet(rect, 12, "int") - top
         x := left + Floor((areaWidth - NumGet(size, 0, "int")) / 2)
-        y := top + Floor((areaHeight - NumGet(size, 4, "int")) / 2)
+        y := top + areaHeight - NumGet(size, 4, "int") - OUTLINE_PIXELS
         ; 周囲8方向を黒で描き、最後に中央を白い太字で描く。
         for offset in [[-1,-1], [0,-1], [1,-1], [-1,0], [1,0], [-1,1], [0,1], [1,1]]
             DllCall("gdi32\TextOutW", "ptr", hdc,
@@ -225,7 +227,7 @@ CreateDateOverlay() {
     window.BackColor := TRANSPARENT
     window.MarginX := 0
     window.MarginY := 0
-    window.SetFont("s" MAX_FONT_SIZE " c" TEXT_COLOR " bold q3", "Segoe UI")
+    window.SetFont("s" MAX_FONT_SIZE " c" TEXT_COLOR " w500 q5", "Segoe UI")
     ; SS_OWNERDRAW=0xD: 背景の透明性を保ったまま、文字を縁取り付きで描く。
     text := window.AddText("vOutlinedDate x0 y0 w1 h1 +0xD", "")
     window.Show("Hide w1 h1")
